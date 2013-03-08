@@ -346,7 +346,8 @@ unlock:
 #define PERF_FLAG_ALL (PERF_FLAG_FD_NO_GROUP |\
 		       PERF_FLAG_FD_OUTPUT  |\
 		       PERF_FLAG_PID_CGROUP |\
-		       PERF_FLAG_FD_CLOEXEC)
+		       PERF_FLAG_FD_CLOEXEC |\
+		       PERF_FLAG_FD_SAMPLE)
 
 /*
  * branch priv levels that need permission checks
@@ -4027,6 +4028,8 @@ static void unaccount_freq_event(void)
 		atomic_dec(&nr_freq_events);
 }
 
+static void put_event(struct perf_event *event);
+
 static void unaccount_event(struct perf_event *event)
 {
 	bool dec = false;
@@ -4059,6 +4062,9 @@ static void unaccount_event(struct perf_event *event)
 		if (!atomic_add_unless(&perf_sched_count, -1, 1))
 			schedule_delayed_work(&perf_sched_work, HZ);
 	}
+
+	if (event->sample_event)
+		put_event(event->sample_event);
 
 	unaccount_event_cpu(event, event->cpu);
 
@@ -5687,6 +5693,92 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
 	}
 }
 
+static unsigned long perf_aux_sampler_trace(struct perf_event *event,
+					    struct perf_sample_data *data)
+{
+	struct perf_event *sampler = event->sample_event;
+	struct ring_buffer *rb;
+	int *disable_count;
+
+	data->aux.size = 0;
+
+	if (!sampler || READ_ONCE(sampler->state) != PERF_EVENT_STATE_ACTIVE)
+		goto out;
+
+	if (READ_ONCE(sampler->oncpu) != smp_processor_id())
+		goto out;
+
+	/*
+	 * Non-zero disable count here means that we, being the NMI
+	 * context, are racing with pmu::add or pmu::del, both of which
+	 * may lead to a dangling hardware event and all manner of mayhem.
+	 */
+	disable_count = this_cpu_ptr(sampler->pmu->pmu_disable_count);
+	if (*disable_count)
+		goto out;
+
+	perf_pmu_disable(sampler->pmu);
+
+	rb = ring_buffer_get(sampler);
+	if (!rb) {
+		perf_pmu_enable(sampler->pmu);
+		goto out;
+	}
+
+	sampler->pmu->stop(sampler, PERF_EF_UPDATE);
+
+	data->aux.to = rb->aux_head;
+
+	if (data->aux.to < sampler->attr.aux_sample_size)
+		data->aux.from = rb->aux_nr_pages * PAGE_SIZE +
+			data->aux.to - sampler->attr.aux_sample_size;
+	else
+		data->aux.from = data->aux.to -
+			sampler->attr.aux_sample_size;
+	data->aux.size = ALIGN(sampler->attr.aux_sample_size, sizeof(u64));
+	ring_buffer_put(rb);
+
+out:
+	return data->aux.size;
+}
+
+static void perf_aux_sampler_output(struct perf_event *event,
+				    struct perf_output_handle *handle,
+				    struct perf_sample_data *data)
+{
+	struct perf_event *sampler = event->sample_event;
+	struct ring_buffer *rb;
+	unsigned long pad;
+	int ret;
+
+	if (WARN_ON_ONCE(!sampler || !data->aux.size))
+		goto out_enable;
+
+	rb = ring_buffer_get(sampler);
+	if (WARN_ON_ONCE(!rb))
+		goto out_enable;
+
+	ret = rb_output_aux(rb, data->aux.from, data->aux.to,
+			    (aux_copyfn)perf_output_copy, handle);
+	if (ret < 0) {
+		pr_warn_ratelimited("failed to copy trace data\n");
+		goto out;
+	}
+
+	pad = data->aux.size - ret;
+	if (pad) {
+		u64 p = 0;
+
+		perf_output_copy(handle, &p, pad);
+	}
+out:
+	ring_buffer_put(rb);
+	sampler->pmu->start(sampler, 0);
+
+out_enable:
+	perf_pmu_enable(sampler->pmu);
+}
+
 static void __perf_event_header__init_id(struct perf_event_header *header,
 					 struct perf_sample_data *data,
 					 struct perf_event *event)
@@ -6013,6 +6105,13 @@ void perf_output_sample(struct perf_output_handle *handle,
 	if (sample_type & PERF_SAMPLE_PHYS_ADDR)
 		perf_output_put(handle, data->phys_addr);
 
+	if (sample_type & PERF_SAMPLE_AUX) {
+		perf_output_put(handle, data->aux.size);
+
+		if (data->aux.size)
+			perf_aux_sampler_output(event, handle, data);
+	}
+
 	if (!event->attr.watermark) {
 		int wakeup_events = event->attr.wakeup_events;
 
@@ -6181,6 +6280,14 @@ void perf_prepare_sample(struct perf_event_header *header,
 
 	if (sample_type & PERF_SAMPLE_PHYS_ADDR)
 		data->phys_addr = perf_virt_to_phys(data->addr);
+
+	if (sample_type & PERF_SAMPLE_AUX) {
+		u64 size = sizeof(u64);
+
+		size += perf_aux_sampler_trace(event, data);
+
+		header->size += size;
+	}
 }
 
 static void __always_inline
@@ -9899,6 +10006,17 @@ again:
 	return gctx;
 }
 
+static bool
+can_sample_for(struct perf_event *sample_event, struct perf_event *event)
+{
+	if (has_aux(sample_event) &&
+	    sample_event->cpu == event->cpu &&
+	    atomic_long_inc_not_zero(&sample_event->refcount))
+		return true;
+
+	return false;
+}
+
 /**
  * sys_perf_event_open - open a performance event, associate it to a task/cpu
  *
@@ -9912,6 +10030,7 @@ SYSCALL_DEFINE5(perf_event_open,
 		pid_t, pid, int, cpu, int, group_fd, unsigned long, flags)
 {
 	struct perf_event *group_leader = NULL, *output_event = NULL;
+	struct perf_event *sample_event = NULL;
 	struct perf_event *event, *sibling;
 	struct perf_event_attr attr;
 	struct perf_event_context *ctx, *uninitialized_var(gctx);
@@ -9982,6 +10101,8 @@ SYSCALL_DEFINE5(perf_event_open,
 		group_leader = group.file->private_data;
 		if (flags & PERF_FLAG_FD_OUTPUT)
 			output_event = group_leader;
+		if (flags & PERF_FLAG_FD_SAMPLE)
+			sample_event = group_leader;
 		if (flags & PERF_FLAG_FD_NO_GROUP)
 			group_leader = NULL;
 	}
@@ -10204,6 +10325,16 @@ SYSCALL_DEFINE5(perf_event_open,
 		}
 	}
 
+	if (sample_event) {
+		/* Grabs sample_event's reference on success */
+		if (!can_sample_for(sample_event, event)) {
+			/* Yes, I know. I'm getting rid of this, promise. */
+			err = -EINVAL;
+			goto err_locked;
+		}
+
+		event->sample_event = sample_event;
+	}
 
 	/*
 	 * Must be under the same ctx::mutex as perf_install_in_context(),
@@ -10510,6 +10641,13 @@ perf_event_exit_event(struct perf_event *child_event,
 		      struct task_struct *child)
 {
 	struct perf_event *parent_event = child_event->parent;
+
+	/*
+	 * Skip over samplers, they are released by the last holder
+	 * of their reference.
+	 */
+	if (child_event->attach_state & PERF_ATTACH_SAMPLING)
+		return;
 
 	/*
 	 * Do not destroy the 'original' grouping; because of the context
