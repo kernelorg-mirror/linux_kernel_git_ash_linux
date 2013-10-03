@@ -9917,7 +9917,8 @@ perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 	/*
 	 * If its not a per-cpu rb, it must be the same task.
 	 */
-	if (output_event->cpu == -1 && output_event->ctx != event->ctx)
+	if (output_event->cpu == -1 &&
+	    output_event->ctx->task != event->ctx->task)
 		goto out;
 
 	/*
@@ -10290,7 +10291,9 @@ SYSCALL_DEFINE5(perf_event_open,
 	}
 
 	if (output_event) {
+		event->ctx = ctx; /* XXX XXX XXX */
 		err = perf_event_set_output(event, output_event);
+		event->ctx = NULL; /* XXX XXX XXX */
 		if (err)
 			goto err_context;
 	}
