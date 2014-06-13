@@ -298,6 +298,7 @@ enum perf_event_read_format {
 					/* add: sample_stack_user */
 #define PERF_ATTR_SIZE_VER4	104	/* add: sample_regs_intr */
 #define PERF_ATTR_SIZE_VER5	112	/* add: aux_watermark */
+#define PERF_ATTR_SIZE_VER6	120	/* add: detached_* */
 
 /*
  * Hardware event_id to monitor via a performance monitoring event:
@@ -416,6 +417,8 @@ struct perf_event_attr {
 	__u32	aux_watermark;
 	__u16	sample_max_stack;
 	__u16	__reserved_2;	/* align to __u64 */
+	__u32	detached_nr_pages;
+	__u32	detached_aux_nr_pages;
 };
 
 #define perf_flags(attr)	(*(&(attr)->read_format + 1))

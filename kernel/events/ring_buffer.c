@@ -774,6 +774,56 @@ void rb_free_aux(struct ring_buffer *rb)
 	}
 }
 
+/*
+ * Allocate a ring_buffer for a detached event and attach it to this event.
+ * There's one ring_buffer per detached event and vice versa, so
+ * ring_buffer_attach() does not apply.
+ */
+int rb_alloc_detached(struct perf_event *event)
+{
+	int aux_nr_pages = event->attr.detached_aux_nr_pages;
+	int nr_pages = event->attr.detached_nr_pages;
+	struct ring_buffer *rb;
+	int ret, pgoff = nr_pages + 1;
+
+	/*
+	 * Use overwrite mode (!RING_BUFFER_WRITABLE) for both data and aux
+	 * areas as we don't want wakeups or interrupts.
+	 */
+	rb = rb_alloc(NULL, nr_pages, 0, event->cpu, 0);
+	if (IS_ERR(rb))
+		return PTR_ERR(rb);
+
+	ret = rb_alloc_aux(rb, event, pgoff, aux_nr_pages, 0, 0);
+	if (ret) {
+		rb_free(rb);
+		return ret;
+	}
+
+	atomic_set(&rb->mmap_count, 1);
+	if (aux_nr_pages)
+		atomic_set(&rb->aux_mmap_count, 1);
+
+	/*
+	 * Detached events don't need ring buffer wakeups, therefore we don't
+	 * use ring_buffer_attach() here and event->rb_entry stays empty.
+	 */
+	rcu_assign_pointer(event->rb, rb);
+
+	return 0;
+}
+
+void rb_free_detached(struct ring_buffer *rb, struct perf_event *event)
+{
+	/* Must be the last one */
+	WARN_ON_ONCE(atomic_read(&rb->refcount) != 1);
+
+	atomic_set(&rb->aux_mmap_count, 0);
+	rcu_assign_pointer(event->rb, NULL);
+	rb_free_aux(rb);
+	rb_free(rb);
+}
+
 #ifndef CONFIG_PERF_USE_VMALLOC
 
 /*

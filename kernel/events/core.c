@@ -2041,7 +2041,15 @@ static int perf_event_detach(struct perf_event *event, struct task_struct *task,
 {
 	int ret;
 
-	return perffs_create_event_file(event, task, &perf_fops);
+	ret = rb_alloc_detached(event);
+	if (ret)
+		return ret;
+
+	ret = perffs_create_event_file(event, task, &perf_fops);
+	if (ret)
+		rb_free_detached(event->rb, event);
+
+	return ret;
 }
 
 #define MAX_INTERRUPTS (~0ULL)
@@ -4093,6 +4101,9 @@ static void _free_event(struct perf_event *event)
 
 	if (event->attach_state & PERF_ATTACH_DETACHED) {
 		event->attach_state &= ~PERF_ATTACH_DETACHED;
+
+		ring_buffer_unaccount(event->rb, false);
+		rb_free_detached(event->rb, event);
 	}
 
 	if (event->rb) {
@@ -4929,6 +4940,10 @@ static int perf_mmap_fault(struct vm_fault *vmf)
 	int ret = VM_FAULT_SIGBUS;
 
 	if (vmf->flags & FAULT_FLAG_MKWRITE) {
+		/* detached events R/O only */
+		if (event->dent)
+			return ret;
+
 		if (vmf->pgoff == 0)
 			ret = 0;
 		return ret;
@@ -9932,6 +9947,9 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (output_event || (group_fd != -1))
 			goto err_task;
 
+		if (!attr.detached_nr_pages)
+			goto err_task;
+
 		detached = 1;
 	}
 
@@ -10095,6 +10113,7 @@ SYSCALL_DEFINE5(perf_event_open,
 			goto err_file;
 
 		atomic_long_inc(&event->refcount);
+		atomic_inc(&event->mmap_count);
 
 		event_file->private_data = event;
 	}
