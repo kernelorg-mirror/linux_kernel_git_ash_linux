@@ -37,6 +37,7 @@ struct ring_buffer {
 	atomic_t			mmap_count;
 	unsigned long			mmap_locked;
 	struct user_struct		*mmap_user;
+	struct mm_struct		*mmap_mapping;
 
 	/* AUX area */
 	long				aux_head;
@@ -57,6 +58,7 @@ struct ring_buffer {
 };
 
 extern void rb_free(struct ring_buffer *rb);
+extern void ring_buffer_unaccount(struct ring_buffer *rb, bool aux);
 
 static inline void rb_free_rcu(struct rcu_head *rcu_head)
 {
@@ -75,7 +77,8 @@ static inline void rb_toggle_paused(struct ring_buffer *rb, bool pause)
 }
 
 extern struct ring_buffer *
-rb_alloc(int nr_pages, long watermark, int cpu, int flags);
+rb_alloc(struct mm_struct *mm, int nr_pages, long watermark, int cpu,
+	 int flags);
 extern void perf_event_wakeup(struct perf_event *event);
 extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 			pgoff_t pgoff, int nr_pages, long watermark, int flags);

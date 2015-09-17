@@ -519,6 +519,88 @@ void *perf_get_aux(struct perf_output_handle *handle)
 }
 EXPORT_SYMBOL_GPL(perf_get_aux);
 
+/*
+ * Check if the current user can afford @nr_pages, considering the
+ * perf_event_mlock sysctl and their mlock limit. If the former is exceeded,
+ * pin the remainder on their mm, if the latter is not sufficient either,
+ * error out. Otherwise, keep track of the pages used in the ring_buffer so
+ * that the accounting can be undone when the pages are freed.
+ */
+static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
+			       unsigned long nr_pages, bool aux)
+{
+	unsigned long total, limit, pinned;
+
+	if (!mm)
+		mm = rb->mmap_mapping;
+
+	rb->mmap_user = current_user();
+
+	limit = sysctl_perf_event_mlock >> (PAGE_SHIFT - 10);
+
+	/*
+	 * Increase the limit linearly with more CPUs:
+	 */
+	limit *= num_online_cpus();
+
+	total = atomic_long_read(&rb->mmap_user->locked_vm) + nr_pages;
+
+	pinned = 0;
+	if (total > limit) {
+		/*
+		 * Everything that's over the sysctl_perf_event_mlock
+		 * limit needs to be accounted to the consumer's mm.
+		 */
+		if (!mm)
+			return -EPERM;
+
+		pinned = total - limit;
+
+		limit = rlimit(RLIMIT_MEMLOCK);
+		limit >>= PAGE_SHIFT;
+		total = mm->pinned_vm + pinned;
+
+		if ((total > limit) && perf_paranoid_tracepoint_raw() &&
+		    !capable(CAP_IPC_LOCK)) {
+			return -EPERM;
+		}
+
+		if (aux)
+			rb->aux_mmap_locked = pinned;
+		else
+			rb->mmap_locked = pinned;
+
+		mm->pinned_vm += pinned;
+	}
+
+	if (!rb->mmap_mapping)
+		rb->mmap_mapping = mm;
+
+	/* account for user page */
+	if (!aux)
+		nr_pages++;
+
+	rb->mmap_user = get_current_user();
+	atomic_long_add(nr_pages, &rb->mmap_user->locked_vm);
+
+	return 0;
+}
+
+/*
+ * Undo the mlock pages accounting done in ring_buffer_account().
+ */
+void ring_buffer_unaccount(struct ring_buffer *rb, bool aux)
+{
+	unsigned long nr_pages = aux ? rb->aux_nr_pages : rb->nr_pages + 1;
+	unsigned long pinned = aux ? rb->aux_mmap_locked : rb->mmap_locked;
+
+	atomic_long_sub(nr_pages, &rb->mmap_user->locked_vm);
+	if (rb->mmap_mapping)
+		rb->mmap_mapping->pinned_vm -= pinned;
+
+	free_uid(rb->mmap_user);
+}
+
 #define PERF_AUX_GFP	(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY)
 
 static struct page *rb_alloc_aux_page(int node, int order)
@@ -588,11 +670,16 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 {
 	bool overwrite = !(flags & RING_BUFFER_WRITABLE);
 	int node = (event->cpu == -1) ? -1 : cpu_to_node(event->cpu);
-	int ret = -ENOMEM, max_order = 0;
+	int ret, max_order = 0;
 
 	if (!has_aux(event))
 		return -EOPNOTSUPP;
 
+	ret = ring_buffer_account(rb, NULL, nr_pages, true);
+	if (ret)
+		return ret;
+
+	ret = -ENOMEM;
 	if (event->pmu->capabilities & PERF_PMU_CAP_AUX_NO_SG) {
 		/*
 		 * We need to start with the max_order that fits in nr_pages,
@@ -607,7 +694,7 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 		if ((event->pmu->capabilities & PERF_PMU_CAP_AUX_SW_DOUBLEBUF) &&
 		    !overwrite) {
 			if (!max_order)
-				return -EINVAL;
+				goto out;
 
 			max_order--;
 		}
@@ -668,18 +755,23 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 		rb->aux_watermark = nr_pages << (PAGE_SHIFT - 1);
 
 out:
-	if (!ret)
+	if (!ret) {
 		rb->aux_pgoff = pgoff;
-	else
+	} else {
+		ring_buffer_unaccount(rb, true);
 		__rb_free_aux(rb);
+	}
 
 	return ret;
 }
 
 void rb_free_aux(struct ring_buffer *rb)
 {
-	if (atomic_dec_and_test(&rb->aux_refcount))
+	if (atomic_dec_and_test(&rb->aux_refcount)) {
+		ring_buffer_unaccount(rb, true);
+
 		__rb_free_aux(rb);
+	}
 }
 
 #ifndef CONFIG_PERF_USE_VMALLOC
@@ -713,22 +805,25 @@ static void *perf_mmap_alloc_page(int cpu)
 	return page_address(page);
 }
 
-struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
+			     int cpu, int flags)
 {
+	unsigned long size = offsetof(struct ring_buffer, data_pages[nr_pages]);
 	struct ring_buffer *rb;
-	unsigned long size;
-	int i;
-
-	size = sizeof(struct ring_buffer);
-	size += nr_pages * sizeof(void *);
+	int i, ret = -ENOMEM;
 
 	rb = kzalloc(size, GFP_KERNEL);
 	if (!rb)
 		goto fail;
 
+	ret = ring_buffer_account(rb, mm, nr_pages, false);
+	if (ret)
+		goto fail_free_rb;
+
+	ret = -ENOMEM;
 	rb->user_page = perf_mmap_alloc_page(cpu);
 	if (!rb->user_page)
-		goto fail_user_page;
+		goto fail_unaccount;
 
 	for (i = 0; i < nr_pages; i++) {
 		rb->data_pages[i] = perf_mmap_alloc_page(cpu);
@@ -748,11 +843,14 @@ fail_data_pages:
 
 	free_page((unsigned long)rb->user_page);
 
-fail_user_page:
+fail_unaccount:
+	ring_buffer_unaccount(rb, false);
+
+fail_free_rb:
 	kfree(rb);
 
 fail:
-	return NULL;
+	return ERR_PTR(ret);
 }
 
 static void perf_mmap_free_page(unsigned long addr)
@@ -819,19 +917,23 @@ void rb_free(struct ring_buffer *rb)
 	schedule_work(&rb->work);
 }
 
-struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
+			     int cpu, int flags)
 {
+	unsigned long size = offsetof(struct ring_buffer, data_pages[1]);
 	struct ring_buffer *rb;
-	unsigned long size;
 	void *all_buf;
-
-	size = sizeof(struct ring_buffer);
-	size += sizeof(void *);
+	int ret = -ENOMEM;
 
 	rb = kzalloc(size, GFP_KERNEL);
 	if (!rb)
 		goto fail;
 
+	ret = ring_buffer_account(rb, mm, nr_pages, false);
+	if (ret)
+		goto fail_free;
+
+	ret = -ENOMEM;
 	INIT_WORK(&rb->work, rb_free_work);
 
 	all_buf = vmalloc_user((nr_pages + 1) * PAGE_SIZE);
@@ -850,10 +952,13 @@ struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
 	return rb;
 
 fail_all_buf:
+	ring_buffer_unaccount(rb, false);
+
+fail_free:
 	kfree(rb);
 
 fail:
-	return NULL;
+	return ERR_PTR(ret);
 }
 
 #endif

@@ -5032,6 +5032,8 @@ void ring_buffer_put(struct ring_buffer *rb)
 	if (!atomic_dec_and_test(&rb->refcount))
 		return;
 
+	ring_buffer_unaccount(rb, false);
+
 	WARN_ON_ONCE(!list_empty(&rb->event_list));
 
 	call_rcu(&rb->rcu_head, rb_free_rcu);
@@ -5066,9 +5068,6 @@ static void perf_mmap_close(struct vm_area_struct *vma)
 	struct perf_event *event = vma->vm_file->private_data;
 
 	struct ring_buffer *rb = ring_buffer_get(event);
-	struct user_struct *mmap_user = rb->mmap_user;
-	int mmap_locked = rb->mmap_locked;
-	unsigned long size = perf_data_size(rb);
 
 	if (event->pmu->event_unmapped)
 		event->pmu->event_unmapped(event, vma->vm_mm);
@@ -5088,11 +5087,7 @@ static void perf_mmap_close(struct vm_area_struct *vma)
 		 */
 		perf_pmu_output_stop(event);
 
-		/* now it's safe to free the pages */
-		atomic_long_sub(rb->aux_nr_pages, &mmap_user->locked_vm);
-		vma->vm_mm->pinned_vm -= rb->aux_mmap_locked;
-
-		/* this has to be the last one */
+		/* now it's safe to free the pages; ought to be the last one */
 		rb_free_aux(rb);
 		WARN_ON_ONCE(atomic_read(&rb->aux_refcount));
 
@@ -5153,19 +5148,6 @@ again:
 	}
 	rcu_read_unlock();
 
-	/*
-	 * It could be there's still a few 0-ref events on the list; they'll
-	 * get cleaned up by free_event() -- they'll also still have their
-	 * ref on the rb and will free it whenever they are done with it.
-	 *
-	 * Aside from that, this buffer is 'fully' detached and unmapped,
-	 * undo the VM accounting.
-	 */
-
-	atomic_long_sub((size >> PAGE_SHIFT) + 1, &mmap_user->locked_vm);
-	vma->vm_mm->pinned_vm -= mmap_locked;
-	free_uid(mmap_user);
-
 out_put:
 	ring_buffer_put(rb); /* could be last */
 }
@@ -5180,13 +5162,9 @@ static const struct vm_operations_struct perf_mmap_vmops = {
 static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct perf_event *event = file->private_data;
-	unsigned long user_locked, user_lock_limit;
-	struct user_struct *user = current_user();
-	unsigned long locked, lock_limit;
 	struct ring_buffer *rb = NULL;
 	unsigned long vma_size;
 	unsigned long nr_pages;
-	long user_extra = 0, extra = 0;
 	int ret = 0, flags = 0;
 
 	/*
@@ -5257,7 +5235,6 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		}
 
 		atomic_set(&rb->aux_mmap_count, 1);
-		user_extra = nr_pages;
 
 		goto accounting;
 	}
@@ -5294,49 +5271,24 @@ again:
 		goto unlock;
 	}
 
-	user_extra = nr_pages + 1;
-
 accounting:
-	user_lock_limit = sysctl_perf_event_mlock >> (PAGE_SHIFT - 10);
-
-	/*
-	 * Increase the limit linearly with more CPUs:
-	 */
-	user_lock_limit *= num_online_cpus();
-
-	user_locked = atomic_long_read(&user->locked_vm) + user_extra;
-
-	if (user_locked > user_lock_limit)
-		extra = user_locked - user_lock_limit;
-
-	lock_limit = rlimit(RLIMIT_MEMLOCK);
-	lock_limit >>= PAGE_SHIFT;
-	locked = vma->vm_mm->pinned_vm + extra;
-
-	if ((locked > lock_limit) && perf_paranoid_tracepoint_raw() &&
-		!capable(CAP_IPC_LOCK)) {
-		ret = -EPERM;
-		goto unlock;
-	}
-
 	WARN_ON(!rb && event->rb);
 
 	if (vma->vm_flags & VM_WRITE)
 		flags |= RING_BUFFER_WRITABLE;
 
 	if (!rb) {
-		rb = rb_alloc(nr_pages,
+		rb = rb_alloc(vma->vm_mm, nr_pages,
 			      event->attr.watermark ? event->attr.wakeup_watermark : 0,
 			      event->cpu, flags);
 
-		if (!rb) {
-			ret = -ENOMEM;
+		if (IS_ERR_OR_NULL(rb)) {
+			ret = PTR_ERR(rb);
+			rb = NULL;
 			goto unlock;
 		}
 
 		atomic_set(&rb->mmap_count, 1);
-		rb->mmap_user = get_current_user();
-		rb->mmap_locked = extra;
 
 		ring_buffer_attach(event, rb);
 
@@ -5345,15 +5297,10 @@ accounting:
 	} else {
 		ret = rb_alloc_aux(rb, event, vma->vm_pgoff, nr_pages,
 				   event->attr.aux_watermark, flags);
-		if (!ret)
-			rb->aux_mmap_locked = extra;
 	}
 
 unlock:
 	if (!ret) {
-		atomic_long_add(user_extra, &user->locked_vm);
-		vma->vm_mm->pinned_vm += extra;
-
 		atomic_inc(&event->mmap_count);
 	} else if (rb) {
 		atomic_dec(&rb->mmap_count);
