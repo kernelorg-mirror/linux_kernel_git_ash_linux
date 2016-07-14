@@ -1113,4 +1113,15 @@ struct pmu_info_header {
 	__u32	pmu_info_size;
 };
 
+struct intel_pt_pmu_info {
+	struct pmu_info_header	pih;
+	__u8			x86_family;
+	__u8			x86_model;
+	__u8			x86_step;
+	__u8			x86_tsc_max_nonturbo_ratio;
+	__u32			x86_tsc_to_art_numerator;
+	__u32			x86_tsc_to_art_denominator;
+	__u32			__reserved_0;
+};
+
 #endif /* _UAPI_LINUX_PERF_EVENT_H */

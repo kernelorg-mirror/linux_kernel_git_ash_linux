@@ -35,6 +35,8 @@
 
 static DEFINE_PER_CPU(struct pt, pt_ctx);
 
+#define PMU_NAME "intel_pt"
+
 static struct pt_pmu pt_pmu;
 
 /*
@@ -269,6 +271,23 @@ fail:
 	kfree(attrs);
 
 	return ret;
+}
+
+static struct intel_pt_pmu_info pt_pmu_info;
+
+static void pt_pmu_info_setup(void)
+{
+	BUILD_BUG_ON(sizeof(pt_pmu_info) +
+	             sizeof(struct perf_event_mmap_page) > PAGE_SIZE);
+	pt_pmu_info.pih.header_size	= sizeof(pt_pmu_info.pih);
+	pt_pmu_info.pih.pmu_info_size	= sizeof(pt_pmu_info) -
+					  pt_pmu_info.pih.header_size;
+	pt_pmu_info.x86_family		= boot_cpu_data.x86;
+	pt_pmu_info.x86_model		= boot_cpu_data.x86_model;
+	pt_pmu_info.x86_step		= boot_cpu_data.x86_mask;
+	pt_pmu_info.x86_tsc_max_nonturbo_ratio = pt_pmu.max_nonturbo_ratio;
+	pt_pmu_info.x86_tsc_to_art_numerator   = pt_pmu.tsc_art_num;
+	pt_pmu_info.x86_tsc_to_art_denominator = pt_pmu.tsc_art_den;
 }
 
 #define RTIT_CTL_CYC_PSB (RTIT_CTL_CYCLEACC	| \
@@ -1512,6 +1531,8 @@ static __init int pt_init(void)
 		return -ENODEV;
 	}
 
+	pt_pmu_info_setup();
+
 	if (!pt_cap_get(PT_CAP_topa_multiple_entries))
 		pt_pmu.pmu.capabilities =
 			PERF_PMU_CAP_AUX_NO_SG | PERF_PMU_CAP_AUX_SW_DOUBLEBUF;
@@ -1531,8 +1552,9 @@ static __init int pt_init(void)
 	pt_pmu.pmu.addr_filters_validate = pt_event_addr_filters_validate;
 	pt_pmu.pmu.nr_addr_filters       =
 		pt_cap_get(PT_CAP_num_address_ranges);
+	pt_pmu.pmu.pmu_info		 = &pt_pmu_info.pih;
 
-	ret = perf_pmu_register(&pt_pmu.pmu, "intel_pt", -1);
+	ret = perf_pmu_register(&pt_pmu.pmu, PMU_NAME, -1);
 
 	return ret;
 }
