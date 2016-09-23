@@ -6476,6 +6476,12 @@ static void perf_event_addr_filters_exec(struct perf_event *event, void *data)
 	if (!has_addr_filter(event))
 		return;
 
+	/*
+	 * if sampling kicks in in the critical section,
+	 * we risk spinlock recursion on the ifh::lock
+	 */
+	perf_pmu_disable(event->pmu);
+
 	raw_spin_lock_irqsave(&ifh->lock, flags);
 	list_for_each_entry(filter, &ifh->list, entry) {
 		if (filter->inode) {
@@ -6489,6 +6495,8 @@ static void perf_event_addr_filters_exec(struct perf_event *event, void *data)
 	if (restart)
 		event->addr_filters_gen++;
 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
+
+	perf_pmu_enable(event->pmu);
 
 	if (restart)
 		perf_event_stop(event, 1);
@@ -7166,6 +7174,8 @@ static void __perf_addr_filters_adjust(struct perf_event *event, void *data)
 	if (!file)
 		return;
 
+	perf_pmu_disable(event->pmu);
+
 	raw_spin_lock_irqsave(&ifh->lock, flags);
 	list_for_each_entry(filter, &ifh->list, entry) {
 		if (perf_addr_filter_match(filter, file, off,
@@ -7180,6 +7190,8 @@ static void __perf_addr_filters_adjust(struct perf_event *event, void *data)
 	if (restart)
 		event->addr_filters_gen++;
 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
+
+	perf_pmu_enable(event->pmu);
 
 	if (restart)
 		perf_event_stop(event, 1);
@@ -8448,6 +8460,8 @@ static void perf_event_addr_filters_apply(struct perf_event *event)
 
 	down_read(&mm->mmap_sem);
 
+	perf_pmu_disable(event->pmu);
+
 	raw_spin_lock_irqsave(&ifh->lock, flags);
 	list_for_each_entry(filter, &ifh->list, entry) {
 		event->addr_filters_offs[count] = 0;
@@ -8465,6 +8479,8 @@ static void perf_event_addr_filters_apply(struct perf_event *event)
 
 	event->addr_filters_gen++;
 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
+
+	perf_pmu_enable(event->pmu);
 
 	up_read(&mm->mmap_sem);
 
