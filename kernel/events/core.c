@@ -2706,16 +2706,17 @@ static int perf_event_stop(struct perf_event *event, int restart)
 void perf_event_addr_filters_sync(struct perf_event *event)
 {
 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
+	unsigned long flags;
 
 	if (!has_addr_filter(event))
 		return;
 
-	raw_spin_lock(&ifh->lock);
+	raw_spin_lock_irqsave(&ifh->lock, flags);
 	if (event->addr_filters_gen != event->hw.addr_filters_gen) {
 		event->pmu->addr_filters_sync(event);
 		event->hw.addr_filters_gen = event->addr_filters_gen;
 	}
-	raw_spin_unlock(&ifh->lock);
+	raw_spin_unlock_irqrestore(&ifh->lock, flags);
 }
 EXPORT_SYMBOL_GPL(perf_event_addr_filters_sync);
 
