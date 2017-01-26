@@ -265,6 +265,13 @@ struct pmu {
 	int * __percpu			pmu_disable_count;
 	struct perf_cpu_context * __percpu pmu_cpu_context;
 	atomic_t			exclusive_cnt; /* < 0: cpu; > 0: tsk */
+
+	/*
+	 * Bitmask of supported AUX allocation orders, for
+	 * !PERF_PMU_CAP_AUX_NO_SG.
+	 */
+	unsigned long			aux_order_mask;
+
 	int				task_ctx_nr;
 	int				hrtimer_interval_ms;
 
