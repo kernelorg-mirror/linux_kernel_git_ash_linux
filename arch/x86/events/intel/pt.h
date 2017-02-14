@@ -178,7 +178,7 @@ struct pt_filters {
 /**
  * struct pt - per-cpu pt context
  * @handle:	perf output handle
- * @filters:		last configured filters
+ * @filters:	last configured filters
  * @handle_nmi:	do handle PT PMI on this cpu, there's an active event
  * @vmx_on:	1 if VMX is ON on this cpu
  */
