@@ -482,9 +482,9 @@ struct perf_addr_filter {
 
 /**
  * struct perf_addr_filters_head - container for address range filters
- * @list:	list of filters for this event
- * @lock:	spinlock that serializes accesses to the @list and event's
- *		(and its children's) filter generations.
+ * @list:		list of filters for this event
+ * @lock:		spinlock that serializes accesses to the @list and
+ *			event's (and its children's) filter generations.
  * @nr_file_filters:	number of file-based filters
  *
  * A child event will use parent's @list (and therefore @lock), so they are
