@@ -126,6 +126,7 @@ struct intel_pt_decoder {
 	uint64_t ctc_delta;
 	uint64_t cycle_cnt;
 	uint64_t cyc_ref_timestamp;
+	int64_t  psb_pos;
 	uint32_t last_mtc;
 	uint32_t tsc_ctc_ratio_n;
 	uint32_t tsc_ctc_ratio_d;
@@ -219,6 +220,7 @@ struct intel_pt_decoder *intel_pt_decoder_new(struct intel_pt_params *params)
 	if (!decoder)
 		return NULL;
 
+	decoder->psb_pos	    = -1;
 	decoder->get_trace          = params->get_trace;
 	decoder->walk_insn          = params->walk_insn;
 	decoder->pgd_ip             = params->pgd_ip;
@@ -1685,6 +1687,17 @@ static int intel_pt_walk_fup_tip(struct intel_pt_decoder *decoder)
 	}
 }
 
+static void intel_pt_got_psb(struct intel_pt_decoder *decoder)
+{
+	if (decoder->psb_pos == -1)
+		intel_pt_log("PSB found; no previous PSBs in the queue\n");
+	else
+		intel_pt_log("PSB found; previous was at %" PRIx64 "\n",
+		             decoder->psb_pos);
+
+	decoder->psb_pos = decoder->pos;
+}
+
 static int intel_pt_walk_trace(struct intel_pt_decoder *decoder)
 {
 	bool no_tip = false;
@@ -1778,6 +1791,7 @@ next:
 		case INTEL_PT_PSB:
 			decoder->last_ip = 0;
 			decoder->have_last_ip = true;
+			intel_pt_got_psb(decoder);
 			intel_pt_clear_stack(&decoder->stack);
 			err = intel_pt_walk_psbend(decoder);
 			if (err == -EAGAIN)
@@ -2263,7 +2277,13 @@ static int intel_pt_scan_for_psb(struct intel_pt_decoder *decoder)
 		}
 
 		decoder->pkt_step = next - decoder->buf;
-		return intel_pt_get_next_packet(decoder);
+		ret = intel_pt_get_next_packet(decoder);
+		if (ret)
+			return ret;
+
+		intel_pt_got_psb(decoder);
+
+		return 0;
 	}
 }
 
