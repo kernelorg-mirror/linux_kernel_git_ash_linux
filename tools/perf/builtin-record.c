@@ -1104,6 +1104,10 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 			disabled = true;
 		}
 	}
+
+	if (opts->auxtrace_snapshot_on_exit)
+		record__read_auxtrace_snapshot(rec);
+
 	trigger_off(&auxtrace_snapshot_trigger);
 	trigger_off(&switch_output_trigger);
 

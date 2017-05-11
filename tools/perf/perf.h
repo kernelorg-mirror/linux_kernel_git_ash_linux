@@ -53,6 +53,7 @@ struct record_opts {
 	bool	     running_time;
 	bool	     full_auxtrace;
 	bool	     auxtrace_snapshot_mode;
+	bool	     auxtrace_snapshot_on_exit;
 	bool	     record_namespaces;
 	bool	     record_switch_events;
 	bool	     all_kernel;
