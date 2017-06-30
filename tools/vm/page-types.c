@@ -75,6 +75,7 @@
 
 #define KPF_BYTES		8
 #define PROC_KPAGEFLAGS		"/proc/kpageflags"
+#define PROC_KPAGECOUNT		"/proc/kpagecount"
 #define PROC_KPAGECGROUP	"/proc/kpagecgroup"
 
 /* [32-] kernel hacking assistances */
@@ -192,6 +193,7 @@ static int		page_size;
 
 static int		pagemap_fd;
 static int		kpageflags_fd;
+static int		kpagecount_fd;
 static int		kpagecgroup_fd = -1;
 
 static int		opt_hwpoison;
@@ -286,6 +288,13 @@ static unsigned long kpageflags_read(uint64_t *buf,
 	return do_u64_read(kpageflags_fd, PROC_KPAGEFLAGS, buf, index, pages);
 }
 
+static unsigned long kpagecount_read(uint64_t *buf,
+				     unsigned long index,
+				     unsigned long pages)
+{
+	return do_u64_read(kpagecount_fd, PROC_KPAGEFLAGS, buf, index, pages);
+}
+
 static unsigned long kpagecgroup_read(uint64_t *buf,
 				      unsigned long index,
 				      unsigned long pages)
@@ -368,16 +377,17 @@ static char *page_flag_longname(uint64_t flags)
  */
 
 static void show_page_range(unsigned long voffset, unsigned long offset,
-			    unsigned long size, uint64_t flags, uint64_t cgroup)
+			    unsigned long size, uint64_t flags, uint64_t mapcount, uint64_t cgroup)
 {
 	static uint64_t      flags0;
+	static uint64_t      mapcount0;
 	static uint64_t	     cgroup0;
 	static unsigned long voff;
 	static unsigned long index;
 	static unsigned long count;
 
 	if (flags == flags0 && cgroup == cgroup0 && offset == index + count &&
-	    size && voffset == voff + count) {
+	    size && voffset == voff + count && mapcount == mapcount0) {
 		count += size;
 		return;
 	}
@@ -389,11 +399,12 @@ static void show_page_range(unsigned long voffset, unsigned long offset,
 			printf("%lu\t", voff);
 		if (opt_list_cgroup)
 			printf("@%llu\t", (unsigned long long)cgroup0);
-		printf("%lx\t%lx\t%s\n",
-				index, count, page_flag_name(flags0));
+		printf("%lx\t%lx\t%s\t%lx\n",
+				index, count, page_flag_name(flags0), mapcount0);
 	}
 
 	flags0 = flags;
+	mapcount0 = mapcount;
 	cgroup0= cgroup;
 	index  = offset;
 	voff   = voffset;
@@ -402,11 +413,11 @@ static void show_page_range(unsigned long voffset, unsigned long offset,
 
 static void flush_page_range(void)
 {
-	show_page_range(0, 0, 0, 0, 0);
+	show_page_range(0, 0, 0, 0, 0, 0);
 }
 
 static void show_page(unsigned long voffset, unsigned long offset,
-		      uint64_t flags, uint64_t cgroup)
+		      uint64_t flags, uint64_t mapcount, uint64_t cgroup)
 {
 	if (opt_pid)
 		printf("%lx\t", voffset);
@@ -414,7 +425,7 @@ static void show_page(unsigned long voffset, unsigned long offset,
 		printf("%lu\t", voffset);
 	if (opt_list_cgroup)
 		printf("@%llu\t", (unsigned long long)cgroup);
-	printf("%lx\t%s\n", offset, page_flag_name(flags));
+	printf("%lx\t%s\t%lx\n", offset, page_flag_name(flags), mapcount);
 }
 
 static void show_summary(void)
@@ -597,7 +608,7 @@ static size_t hash_slot(uint64_t flags)
 }
 
 static void add_page(unsigned long voffset, unsigned long offset,
-		     uint64_t flags, uint64_t cgroup, uint64_t pme)
+		     uint64_t flags, uint64_t mapcount, uint64_t cgroup, uint64_t pme)
 {
 	flags = kpageflags_flags(flags, pme);
 
@@ -613,9 +624,9 @@ static void add_page(unsigned long voffset, unsigned long offset,
 		unpoison_page(offset);
 
 	if (opt_list == 1)
-		show_page_range(voffset, offset, 1, flags, cgroup);
+		show_page_range(voffset, offset, 1, flags, mapcount, cgroup);
 	else if (opt_list == 2)
-		show_page(voffset, offset, flags, cgroup);
+		show_page(voffset, offset, flags, mapcount, cgroup);
 
 	nr_pages[hash_slot(flags)]++;
 	total_pages++;
@@ -628,6 +639,7 @@ static void walk_pfn(unsigned long voffset,
 		     uint64_t pme)
 {
 	uint64_t buf[KPAGEFLAGS_BATCH];
+	uint64_t  mc[KPAGEFLAGS_BATCH];
 	uint64_t cgi[KPAGEFLAGS_BATCH];
 	unsigned long batch;
 	unsigned long pages;
@@ -649,11 +661,14 @@ static void walk_pfn(unsigned long voffset,
 		if (pages == 0)
 			break;
 
+		if (kpagecount_read(mc, index, batch) != pages)
+			fatal("kpagecount returned fewer pages than expected");
+
 		if (kpagecgroup_read(cgi, index, pages) != pages)
 			fatal("kpagecgroup returned fewer pages than expected");
 
 		for (i = 0; i < pages; i++)
-			add_page(voffset + i, index + i, buf[i], cgi[i], pme);
+			add_page(voffset + i, index + i, buf[i], mc[i], cgi[i], pme);
 
 		index += pages;
 		count -= pages;
@@ -671,9 +686,9 @@ static void walk_swap(unsigned long voffset, uint64_t pme)
 		return;
 
 	if (opt_list == 1)
-		show_page_range(voffset, pagemap_swap_offset(pme), 1, flags, 0);
+		show_page_range(voffset, pagemap_swap_offset(pme), 1, flags, -1, 0);
 	else if (opt_list == 2)
-		show_page(voffset, pagemap_swap_offset(pme), flags, 0);
+		show_page(voffset, pagemap_swap_offset(pme), flags, -1, 0);
 
 	nr_pages[hash_slot(flags)]++;
 	total_pages++;
@@ -744,6 +759,7 @@ static void walk_addr_ranges(void)
 	int i;
 
 	kpageflags_fd = checked_open(PROC_KPAGEFLAGS, O_RDONLY);
+	kpagecount_fd = checked_open(PROC_KPAGECOUNT, O_RDONLY);
 
 	if (!nr_addr_ranges)
 		add_addr_range(0, ULONG_MAX);
@@ -844,6 +860,7 @@ static void parse_pid(const char *str)
 
 	sprintf(buf, "/proc/%d/pagemap", opt_pid);
 	pagemap_fd = checked_open(buf, O_RDONLY);
+	kpagecount_fd = checked_open(PROC_KPAGECOUNT, O_RDONLY);
 
 	sprintf(buf, "/proc/%d/maps", opt_pid);
 	file = fopen(buf, "r");
@@ -987,7 +1004,7 @@ got_sigbus:
 				show_file(name, st);
 			}
 			add_page(off / page_size + i, pfn,
-				 flags, cgroup, buf[i]);
+				 flags, -1, cgroup, buf[i]);
 		}
 	}
 
@@ -1014,6 +1031,7 @@ static void walk_page_cache(void)
 	struct stat st;
 
 	kpageflags_fd = checked_open(PROC_KPAGEFLAGS, O_RDONLY);
+	kpagecount_fd = checked_open(PROC_KPAGECOUNT, O_RDONLY);
 	pagemap_fd = checked_open("/proc/self/pagemap", O_RDONLY);
 	sigaction(SIGBUS, &sigbus_action, NULL);
 
