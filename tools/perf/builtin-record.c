@@ -239,6 +239,14 @@ static int record__auxtrace_mmap_read_snapshot(struct record *rec,
 	return 0;
 }
 
+static inline struct perf_mmap *perf_evlist__get_mmap(struct perf_evlist *evlist, int idx)
+{
+	if (evlist->overwrite_mmap)
+		return &evlist->overwrite_mmap[idx];
+
+	return &evlist->mmap[idx];
+}
+
 static int record__auxtrace_read_snapshot_all(struct record *rec)
 {
 	int i;
@@ -246,7 +254,7 @@ static int record__auxtrace_read_snapshot_all(struct record *rec)
 
 	for (i = 0; i < rec->evlist->nr_mmaps; i++) {
 		struct auxtrace_mmap *mm =
-				&rec->evlist->mmap[i].auxtrace_mmap;
+				&(perf_evlist__get_mmap(rec->evlist, i)->auxtrace_mmap);
 
 		if (!mm->base)
 			continue;
