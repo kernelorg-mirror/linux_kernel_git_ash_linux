@@ -679,7 +679,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 	 * Per-cpu recording needs sched_switch events to distinguish different
 	 * threads.
 	 */
-	if (have_timing_info && !cpu_map__empty(cpus)) {
+	if (have_timing_info && !cpu_map__empty(cpus) && !opts->detached && !evlist->files) {
 		if (perf_can_record_switch_events()) {
 			bool cpu_wide = !target__none(&opts->target) &&
 					!target__has_task(&opts->target);
@@ -742,7 +742,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 	}
 
 	/* Add dummy event to keep tracking */
-	if (opts->full_auxtrace) {
+	if (opts->full_auxtrace && !opts->detached && !evlist->files) {
 		struct perf_evsel *tracking_evsel;
 
 		err = parse_events(evlist, "dummy:u", NULL);
