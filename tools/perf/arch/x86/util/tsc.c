@@ -71,7 +71,8 @@ int perf_event__synth_time_conv(const struct perf_event_mmap_page *pc,
 	if (err)
 		return err;
 
-	pr_debug2("Synthesizing TSC conversion information\n");
+	pr_debug2("Synthesizing TSC conversion information: %x %x %lx\n",
+	          tc.time_mult, tc.time_shift, tc.time_zero);
 
 	event.time_conv.time_mult  = tc.time_mult;
 	event.time_conv.time_shift = tc.time_shift;

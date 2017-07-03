@@ -456,6 +456,9 @@ static int write_event_desc(struct feat_fd *ff,
 		if (ret < 0)
 			return ret;
 
+		for (ret = 0; ret < (int)evsel->ids; ret++)
+			fprintf(stderr, " => %s: %lx\n",
+			        perf_evsel__name(evsel), evsel->id[ret]);
 		/*
 		 * write event string as passed on cmdline
 		 */

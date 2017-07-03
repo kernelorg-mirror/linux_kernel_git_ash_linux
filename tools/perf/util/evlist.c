@@ -635,6 +635,8 @@ static int perf_evlist__event2id(struct perf_evlist *evlist,
 		n -= evlist->is_pos;
 		*id = array[n];
 	}
+	/*fprintf(stderr, "event %x: %"PRIx64"\n",
+	        event->header.type, *id);*/
 	return 0;
 }
 
@@ -668,6 +670,7 @@ struct perf_evsel *perf_evlist__event2evsel(struct perf_evlist *evlist,
 		if (sid->id == id)
 			return sid->evsel;
 	}
+	pr_err("Couldn't find evsel for id: %"PRIx64"\n", id);
 	return NULL;
 }
 
@@ -1581,8 +1584,10 @@ int perf_evlist__parse_sample(struct perf_evlist *evlist, union perf_event *even
 {
 	struct perf_evsel *evsel = perf_evlist__event2evsel(evlist, event);
 
-	if (!evsel)
+	if (!evsel) {
+		pr_err("Couldn't find event for event %d\n", event->header.type);
 		return -EFAULT;
+	}
 	return perf_evsel__parse_sample(evsel, event, sample);
 }
 

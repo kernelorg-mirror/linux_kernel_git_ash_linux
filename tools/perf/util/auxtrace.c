@@ -1202,6 +1202,7 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	union perf_event ev;
 	void *data1, *data2;
 
+	fprintf(stderr, "%s\n", __func__);
 	if (snapshot) {
 		head = auxtrace_mmap__read_snapshot_head(mm);
 		if (auxtrace_record__find_snapshot(itr, mm->idx, mm, data,
