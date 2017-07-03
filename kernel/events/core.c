@@ -4497,7 +4497,19 @@ EXPORT_SYMBOL_GPL(perf_event_release_kernel);
  */
 static int perf_release(struct inode *inode, struct file *file)
 {
-	perf_event_release_kernel(file->private_data);
+	struct perf_event *event = file->private_data;
+
+	/*
+	 * For a DETACHED event, perf_release() can't have the last reference,
+	 * because we grabbed one extra in the sys_perf_event_open, IOW it is
+	 * always put_event(). In order for it to be the last reference, we'd
+	 * first need to ioctl(REATTACH) on this event, which would drop the
+	 * PERF_ATTACH_DETACHED attach state.
+	 */
+	if (event->attach_state & PERF_ATTACH_DETACHED)
+		put_event(event);
+	else
+		perf_event_release_kernel(file->private_data);
 	return 0;
 }
 
@@ -4860,6 +4872,12 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 	void (*func)(struct perf_event *);
 	u32 flags = arg;
 
+	if (event->attach_state & PERF_ATTACH_DETACHED &&
+	    cmd != PERF_EVENT_IOC_REATTACH &&
+	    cmd != PERF_EVENT_IOC_SET_FILTER &&
+	    cmd != PERF_EVENT_IOC_ID)
+		return -EINVAL;
+
 	switch (cmd) {
 	case PERF_EVENT_IOC_ENABLE:
 		func = _perf_event_enable;
@@ -4923,6 +4941,19 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 		rcu_read_unlock();
 		return 0;
 	}
+	case PERF_EVENT_IOC_REATTACH:
+		/*
+		 * DETACHED state is serialized on ctx::mutex
+		 */
+		if (!is_detached_event(event))
+			return -EINVAL;
+
+		event->attach_state &= ~PERF_ATTACH_DETACHED;
+		perffs_remove(event->dent);
+		event->dent = NULL;
+		put_event(event); /* can't be last */
+
+		return 0;
 	default:
 		return -ENOTTY;
 	}
