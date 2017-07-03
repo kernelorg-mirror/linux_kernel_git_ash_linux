@@ -175,6 +175,7 @@ int perf_evlist__mmap_ex(struct perf_evlist *evlist, unsigned int pages,
 int perf_evlist__mmap(struct perf_evlist *evlist, unsigned int pages);
 void perf_evlist__munmap(struct perf_evlist *evlist);
 
+unsigned long perf_evlist__mmap_pages(unsigned long pages);
 size_t perf_evlist__mmap_size(unsigned long pages);
 
 void perf_evlist__disable(struct perf_evlist *evlist);
