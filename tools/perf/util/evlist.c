@@ -1089,6 +1089,10 @@ int perf_evlist__mmap_ex(struct perf_evlist *evlist, unsigned int pages,
 	pr_debug("mmap size %zuB\n", evlist->mmap_len);
 	mp.mask = evlist->mmap_len - page_size - 1;
 
+	/* detached events can only be mapped R/O */
+	if (evlist->detached || evlist->files)
+		mp.prot = PROT_READ;
+
 	auxtrace_mmap_params__init(&mp.auxtrace_mp, evlist->mmap_len,
 				   auxtrace_pages, auxtrace_overwrite);
 
