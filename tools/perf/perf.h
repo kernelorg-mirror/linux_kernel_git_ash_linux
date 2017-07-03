@@ -36,6 +36,8 @@ void pthread__unblock_sigwinch(void);
 
 struct record_opts {
 	struct target target;
+	bool	     detached;
+	bool	     reattach;
 	bool	     group;
 	bool	     inherit_stat;
 	bool	     no_buffering;

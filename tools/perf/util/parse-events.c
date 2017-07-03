@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/param.h>
+#include <sys/mman.h>
 #include "term.h"
 #include "../perf.h"
 #include "evlist.h"
@@ -597,6 +598,62 @@ struct __add_bpf_event_param {
 	struct list_head *list;
 	struct list_head *head_config;
 };
+
+int parse_events_open_event_file(struct parse_events_state *parse_state,
+                                 struct list_head *list,
+                                 char *file)
+{
+	struct perf_event_mmap_page *up;
+	struct perf_event_attr attr, *orig_attr;
+	struct perf_evsel *evsel;
+	int fd;
+
+	if (!list_empty(list))
+		return -EINVAL;
+
+	/* open file, mmap the first page and fetch the attribute */
+
+	fd = open(file, O_RDWR);
+	if (fd < 0)
+		return -ENOENT;
+
+	up = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (up == MAP_FAILED) {
+		if (asprintf(&parse_state->error->str, "%m\n") < 0)
+			parse_state->error->str = NULL;
+		close(fd);
+		return -EINVAL;
+	}
+
+	if (up->pmu_size) {
+		orig_attr = (void *)up + up->pmu_offset;
+		memcpy(&attr, orig_attr, sizeof(attr));
+		fprintf(stderr, "attr.detached_nr_pages: %u/%u\n",
+		        attr.detached_nr_pages, attr.detached_aux_nr_pages);
+	} else {
+		memset(&attr, 0, sizeof(attr));
+	}
+
+	munmap(up, page_size);
+
+	evsel = __add_event(list, &parse_state->idx, &attr, file, NULL, NULL, false);
+	if (!evsel)
+		return -ENOMEM;
+
+	if (attr.type == PERF_TYPE_TRACEPOINT) {
+		struct tracepoint_path *tp = tracepoint_id_to_path(attr.config);
+
+		if (asprintf(&evsel->name, "%s:%s", tp->system, tp->name) < 0)
+			return -ENOMEM; /* XXX */
+		evsel->tp_format = trace_event__tp_format(tp->system, tp->name);
+		fprintf(stderr, "# tracepoint %s\n", evsel->name);
+	}
+
+	evsel->detached_fd = fd;
+	parse_state->evlist->files = true;
+
+	return 0;
+}
 
 static int add_bpf_event(const char *group, const char *event, int fd,
 			 void *_param)

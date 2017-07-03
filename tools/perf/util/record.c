@@ -138,6 +138,10 @@ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts,
 	bool use_sample_identifier = false;
 	bool use_comm_exec;
 
+	/* we can't modify the attribute */
+	if (evlist->files)
+		goto out;
+
 	/*
 	 * Set the evsel leader links before we configure attributes,
 	 * since some might depend on this info.
@@ -178,6 +182,7 @@ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts,
 			perf_evsel__set_sample_id(evsel, use_sample_identifier);
 	}
 
+out:
 	perf_evlist__set_id_pos(evlist);
 }
 

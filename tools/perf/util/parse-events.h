@@ -144,6 +144,8 @@ int parse_events_add_tracepoint(struct list_head *list, int *idx,
 				const char *sys, const char *event,
 				struct parse_events_error *error,
 				struct list_head *head_config);
+int parse_events_open_event_file(struct parse_events_state *parse_state,
+                                 struct list_head *list, char *file);
 int parse_events_load_bpf(struct parse_events_state *parse_state,
 			  struct list_head *list,
 			  char *bpf_file_name,

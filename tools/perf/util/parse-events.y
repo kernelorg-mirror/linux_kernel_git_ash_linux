@@ -45,7 +45,7 @@ static void inc_group_count(struct list_head *list,
 %token PE_START_EVENTS PE_START_TERMS
 %token PE_VALUE PE_VALUE_SYM_HW PE_VALUE_SYM_SW PE_RAW PE_TERM
 %token PE_EVENT_NAME
-%token PE_NAME
+%token PE_NAME PE_FILE_NAME
 %token PE_BPF_OBJECT PE_BPF_SOURCE
 %token PE_MODIFIER_EVENT PE_MODIFIER_BP
 %token PE_NAME_CACHE_TYPE PE_NAME_CACHE_OP_RESULT
@@ -60,6 +60,7 @@ static void inc_group_count(struct list_head *list,
 %type <num> PE_RAW
 %type <num> PE_TERM
 %type <str> PE_NAME
+%type <str> PE_FILE_NAME
 %type <str> PE_BPF_OBJECT
 %type <str> PE_BPF_SOURCE
 %type <str> PE_NAME_CACHE_TYPE
@@ -73,6 +74,7 @@ static void inc_group_count(struct list_head *list,
 %type <head> event_config
 %type <head> opt_event_config
 %type <term> event_term
+%type <head> event_file
 %type <head> event_pmu
 %type <head> event_legacy_symbol
 %type <head> event_legacy_cache
@@ -213,7 +215,8 @@ PE_EVENT_NAME event_def
 |
 event_def
 
-event_def: event_pmu |
+event_def: event_file |
+	   event_pmu |
 	   event_legacy_symbol |
 	   event_legacy_cache sep_dc |
 	   event_legacy_mem |
@@ -468,6 +471,17 @@ PE_BPF_SOURCE opt_event_config
 	ALLOC_LIST(list);
 	ABORT_ON(parse_events_load_bpf(_parse_state, list, $1, true, $2));
 	parse_events_terms__delete($2);
+	$$ = list;
+}
+
+event_file:
+PE_FILE_NAME
+{
+	struct parse_events_state *parse_state = _parse_state;
+	struct list_head *list;
+
+	ALLOC_LIST(list);
+	ABORT_ON(parse_events_open_event_file(parse_state, list, $1));
 	$$ = list;
 }
 

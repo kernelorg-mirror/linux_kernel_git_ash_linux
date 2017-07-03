@@ -49,6 +49,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <linux/time64.h>
@@ -403,6 +404,11 @@ try_again:
 		rc = -1;
 		goto out;
 	}
+
+	/* Don't even try to mmap detached events. */
+	rc = 0;
+	if (rec->opts.detached)
+		goto out;
 
 	rc = record__mmap(rec);
 	if (rc)
@@ -858,6 +864,11 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	signal(SIGTERM, sig_handler);
 	signal(SIGSEGV, sigsegv_handler);
 
+	if (rec->opts.detached && forks) {
+		pr_err("I can't let you do that, Dave.\n");
+		return -1;
+	}
+
 	if (rec->opts.record_namespaces)
 		tool->namespace_events = true;
 
@@ -1015,6 +1026,9 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		usleep(opts->initial_delay * USEC_PER_MSEC);
 		perf_evlist__enable(rec->evlist);
 	}
+
+	if (opts->detached)
+		goto out_child;
 
 	trigger_ready(&auxtrace_snapshot_trigger);
 	trigger_ready(&switch_output_trigger);
@@ -1653,12 +1667,109 @@ static struct option __record_options[] = {
 			  &record.switch_output.set, "signal,size,time",
 			  "Switch output when receive SIGUSR2 or cross size,time threshold",
 			  "signal"),
+	OPT_BOOLEAN(0, "detached", &record.opts.detached,
+	            "Create detached events and leave instead of collecting data"),
+	OPT_BOOLEAN(0, "reattach", &record.opts.reattach,
+	            "Reattach all detached events"),
 	OPT_BOOLEAN(0, "dry-run", &dry_run,
 		    "Parse options then exit"),
 	OPT_END()
 };
 
 struct option *record_options = __record_options;
+
+static int files_record__options(struct perf_evlist *evlist, struct record_opts *opts)
+{
+	struct perf_evsel *evsel;
+
+	if (!evlist->files)
+		return 0;
+
+	evsel = perf_evlist__first(evlist);
+
+	evlist->overwrite = true;
+	opts->overwrite = true;
+	//opts->tail_synthesize = true;
+	opts->target.per_thread = true; /* XXX */
+	opts->mmap_pages = evsel->attr.detached_nr_pages;
+	opts->auxtrace_mmap_pages = evsel->attr.detached_aux_nr_pages;
+	fprintf(stderr, "%s: detached_nr_pages: %d detached_aux_nr_pages: %d\n", __func__,
+	        opts->mmap_pages, opts->auxtrace_mmap_pages);
+
+	evlist__for_each_entry(evlist, evsel) {
+		if (evsel->detached_fd == -1) {
+			pr_err("Can't mix detached events with new events.\n"
+			       "Event %s can't be added.\n", evsel->name);
+			return -EINVAL;
+		}
+
+		if (evsel->attr.detached_nr_pages != opts->mmap_pages ||
+		    evsel->attr.detached_aux_nr_pages != opts->auxtrace_mmap_pages) {
+			pr_err("Can't mix detached events with different "
+			       "buffer sizes.\nEvent %s can't be added.\n",
+			       evsel->name);
+		}
+
+		if (evsel->attr.detached_aux_nr_pages) {
+			opts->full_auxtrace = true;
+			opts->auxtrace_snapshot_mode = true;
+			opts->auxtrace_snapshot_on_exit = true;
+		}
+
+		fprintf(stderr, " ---> %s (%d)\n", evsel->name, evsel->detached_fd);
+	}
+
+	return 0;
+}
+
+static void detached_record__options(struct perf_evlist *evlist, struct record_opts *opts)
+{
+	struct perf_evsel *evsel;
+
+	if (!opts->detached)
+		return;
+
+	/* detached buffers are read-only */
+	opts->overwrite = true;
+	//opts->tail_synthesize = true;
+
+	if (opts->full_auxtrace) {
+		opts->full_auxtrace = true;
+		opts->auxtrace_snapshot_mode = true;
+	}
+
+	evlist__for_each_entry(evlist, evsel) {
+		evsel->attr.detached_nr_pages = perf_evlist__mmap_pages(opts->mmap_pages);
+		evsel->attr.detached_aux_nr_pages = opts->auxtrace_mmap_pages;
+
+		/* XXX: need to set attr.inherit for SHMEM/COREDUMP events */
+		if (cpu_map__nr(evsel->cpus) == 1 && evsel->attr.exclude_kernel)
+			evsel->attr.inherit = 1;
+
+		fprintf(stderr, "%s: detached_nr_pages: %d detached_aux_nr_pages: %d\n", __func__,
+		        opts->mmap_pages, opts->auxtrace_mmap_pages);
+		evsel->immediate = true;
+	}
+}
+
+static int detached__reattach(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel;
+	int err;
+
+	evlist__for_each_entry(evlist, evsel) {
+		if (evsel->detached_fd == -1)
+			continue;
+
+		err = ioctl(evsel->detached_fd, PERF_EVENT_IOC_REATTACH);
+		if (err) {
+			pr_err("Reattaching failed for event '%s'\n", evsel->name);
+			return err;
+		}
+	}
+
+	return 0;
+}
 
 int cmd_record(int argc, const char **argv)
 {
@@ -1752,6 +1863,17 @@ int cmd_record(int argc, const char **argv)
 	if (dry_run)
 		goto out;
 
+	if (rec->opts.reattach) {
+		if (rec->opts.detached) {
+			pr_err("Can't use --reattach and --detached together.\n");
+			goto out;
+		}
+
+		err = detached__reattach(rec->evlist);
+		if (err)
+			goto out;
+	}
+
 	err = bpf__setup_stdout(rec->evlist);
 	if (err) {
 		bpf__strerror_setup_stdout(rec->evlist, err, errbuf, sizeof(errbuf));
@@ -1812,7 +1934,7 @@ int cmd_record(int argc, const char **argv)
 		goto out;
 	}
 
-	if (rec->opts.target.tid && !rec->opts.no_inherit_set)
+	if (rec->opts.target.tid && !rec->opts.no_inherit_set && !rec->opts.detached)
 		rec->opts.no_inherit = true;
 
 	err = target__validate(&rec->opts.target);
@@ -1835,6 +1957,10 @@ int cmd_record(int argc, const char **argv)
 	/* Enable ignoring missing threads when -u/-p option is defined. */
 	rec->opts.ignore_missing_thread = rec->opts.target.uid != UINT_MAX || rec->opts.target.pid;
 
+	err = files_record__options(rec->evlist, &rec->opts);
+	if (err)
+		goto out;
+
 	err = -ENOMEM;
 	if (perf_evlist__create_maps(rec->evlist, &rec->opts.target) < 0)
 		usage_with_options(record_usage, record_options);
@@ -1842,6 +1968,8 @@ int cmd_record(int argc, const char **argv)
 	err = auxtrace_record__options(rec->itr, rec->evlist, &rec->opts);
 	if (err)
 		goto out;
+
+	detached_record__options(rec->evlist, &rec->opts);
 
 	/*
 	 * We take all buildids when the file contains
@@ -1856,7 +1984,11 @@ int cmd_record(int argc, const char **argv)
 		goto out;
 	}
 
-	err = __cmd_record(&record, argc, argv);
+	if (rec->opts.detached) {
+		err = record__open(rec);
+	} else {
+		err = __cmd_record(&record, argc, argv);
+	}
 out:
 	perf_evlist__delete(rec->evlist);
 	symbol__exit();

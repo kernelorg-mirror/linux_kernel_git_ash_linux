@@ -171,6 +171,7 @@ event_pmu	[^,{}/]+[/][^/]*[/][^,{}/]*
 event		[^,{}/]+
 bpf_object	[^,{}]+\.(o|bpf)[a-zA-Z0-9._]*
 bpf_source	[^,{}]+\.c[a-zA-Z0-9._]*
+event_file	[^,{}]+\.event
 
 num_dec		[0-9]+
 num_hex		0x[a-fA-F0-9]+
@@ -218,6 +219,7 @@ modifier_bp	[rwx]{1,3}
 {event_pmu}	|
 {bpf_object}	|
 {bpf_source}	|
+{event_file}	|
 {event}		{
 			BEGIN(INITIAL);
 			REWIND(1);
@@ -341,6 +343,7 @@ r{num_raw_hex}		{ return raw(yyscanner); }
 {num_hex}		{ return value(yyscanner, 16); }
 
 {modifier_event}	{ return str(yyscanner, PE_MODIFIER_EVENT); }
+{event_file}		{ return str(yyscanner, PE_FILE_NAME); }
 {bpf_object}		{ if (!isbpf(yyscanner)) { USER_REJECT }; return str(yyscanner, PE_BPF_OBJECT); }
 {bpf_source}		{ if (!isbpf(yyscanner)) { USER_REJECT }; return str(yyscanner, PE_BPF_SOURCE); }
 {name}			{ return pmu_str_check(yyscanner); }
