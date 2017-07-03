@@ -298,6 +298,7 @@ enum perf_event_read_format {
 					/* add: sample_stack_user */
 #define PERF_ATTR_SIZE_VER4	104	/* add: sample_regs_intr */
 #define PERF_ATTR_SIZE_VER5	112	/* add: aux_watermark */
+#define PERF_ATTR_SIZE_VER6	120	/* add: detached_* */
 
 /*
  * Hardware event_id to monitor via a performance monitoring event:
@@ -416,6 +417,8 @@ struct perf_event_attr {
 	__u32	aux_watermark;
 	__u16	sample_max_stack;
 	__u16	__reserved_2;	/* align to __u64 */
+	__u32	detached_nr_pages;
+	__u32	detached_aux_nr_pages;
 };
 
 #define perf_flags(attr)	(*(&(attr)->read_format + 1))
@@ -433,6 +436,7 @@ struct perf_event_attr {
 #define PERF_EVENT_IOC_ID		_IOR('$', 7, __u64 *)
 #define PERF_EVENT_IOC_SET_BPF		_IOW('$', 8, __u32)
 #define PERF_EVENT_IOC_PAUSE_OUTPUT	_IOW('$', 9, __u32)
+#define PERF_EVENT_IOC_REATTACH		_IO ('$', 10)
 
 enum perf_event_ioc_flags {
 	PERF_IOC_FLAG_GROUP		= 1U << 0,
@@ -597,6 +601,16 @@ struct perf_event_mmap_page {
 	__u64	aux_tail;
 	__u64	aux_offset;
 	__u64	aux_size;
+
+	/*
+	 * PMU data: static info that (AUX) decoder wants to know in order to
+	 * decode correctly:
+	 *
+	 *   pmu_offset >= sizeof(struct perf_event_mmap_page)
+	 *   pmu_offset + pmu_size <= PAGE_SIZE
+	 */
+	__u64	pmu_offset;
+	__u64	pmu_size;
 };
 
 #define PERF_RECORD_MISC_CPUMODE_MASK		(7 << 0)
@@ -952,6 +966,7 @@ enum perf_callchain_context {
 #define PERF_FLAG_FD_OUTPUT		(1UL << 1)
 #define PERF_FLAG_PID_CGROUP		(1UL << 2) /* pid=cgroup id, per-cpu mode only */
 #define PERF_FLAG_FD_CLOEXEC		(1UL << 3) /* O_CLOEXEC */
+#define PERF_FLAG_DETACHED		(1UL << 4) /* event w/o owner */
 
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 union perf_mem_data_src {
