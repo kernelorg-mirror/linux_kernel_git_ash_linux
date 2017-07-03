@@ -244,6 +244,7 @@ void perf_evsel__init(struct perf_evsel *evsel,
 	evsel->scale	   = 1.0;
 	evsel->evlist	   = NULL;
 	evsel->bpf_fd	   = -1;
+	evsel->detached_fd = -1;
 	INIT_LIST_HEAD(&evsel->node);
 	INIT_LIST_HEAD(&evsel->config_terms);
 	perf_evsel__object.init(evsel);
@@ -728,6 +729,11 @@ static void apply_config_terms(struct perf_evsel *evsel,
 	int max_stack = 0;
 	const char *callgraph_buf = NULL;
 
+	if (evsel->detached_fd != -1)
+		return;
+
+	evsel->detached = opts->detached;
+
 	/* callgraph default */
 	param.record_mode = callchain_param.record_mode;
 
@@ -860,6 +866,9 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts,
 	struct perf_event_attr *attr = &evsel->attr;
 	int track = evsel->tracking;
 	bool per_cpu = opts->target.default_per_cpu && !opts->target.per_thread;
+
+	if (evsel->detached_fd != -1)
+		return;
 
 	attr->sample_id_all = perf_missing_features.sample_id_all ? 0 : 1;
 	attr->inherit	    = !opts->no_inherit;
@@ -1590,6 +1599,8 @@ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
 	PRINT_ATTRf(sample_regs_intr, p_hex);
 	PRINT_ATTRf(aux_watermark, p_unsigned);
 	PRINT_ATTRf(sample_max_stack, p_unsigned);
+	PRINT_ATTRf(detached_nr_pages, p_unsigned);
+	PRINT_ATTRf(detached_aux_nr_pages, p_unsigned);
 
 	return ret;
 }
@@ -1670,6 +1681,8 @@ static bool ignore_missing_thread(struct perf_evsel *evsel,
 	return true;
 }
 
+#include <api/fs/fs.h>
+
 int perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 		     struct thread_map *threads)
 {
@@ -1680,6 +1693,9 @@ int perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 
 	if (perf_missing_features.write_backward && evsel->attr.write_backward)
 		return -EINVAL;
+
+	if (evsel->detached)
+		flags |= PERF_FLAG_DETACHED;
 
 	if (cpus == NULL) {
 		static struct cpu_map *empty_cpu_map;
@@ -1705,7 +1721,7 @@ int perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 		threads = empty_thread_map;
 	}
 
-	if (evsel->system_wide)
+	if (evsel->system_wide || evsel->detached_fd)
 		nthreads = 1;
 	else
 		nthreads = threads->nr;
@@ -1756,6 +1772,11 @@ retry_sample_id:
 			if (!evsel->cgrp && !evsel->system_wide)
 				pid = thread_map__pid(threads, thread);
 
+			if (pid == -1 && evsel->detached) {
+				pr_err("--detached doesn't make sense with workloads, use -p instead\n");
+				return -EINVAL;
+			}
+
 			group_fd = get_group_fd(evsel, cpu, thread);
 retry_open:
 			pr_debug2("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx",
@@ -1763,8 +1784,11 @@ retry_open:
 
 			test_attr__ready();
 
-			fd = sys_perf_event_open(&evsel->attr, pid, cpus->map[cpu],
-						 group_fd, flags);
+			if (evsel->detached_fd != -1)
+				fd = evsel->detached_fd;
+			else
+				fd = sys_perf_event_open(&evsel->attr, pid, cpus->map[cpu],
+				                         group_fd, flags);
 
 			FD(evsel, cpu, thread) = fd;
 
@@ -1790,6 +1814,19 @@ retry_open:
 				goto try_fallback;
 			}
 
+			if (evsel->detached) {
+				char *path, buf[PATH_MAX];
+				err = asprintf(&path, "%s/self/fd/%d",
+				               procfs__mountpoint(), fd);
+				if (err < 0)
+					return -ENOMEM; /* XXX */
+
+				err = readlink(path, buf, PATH_MAX);
+				if (err > 0) {
+					evsel->detached_file = strdup(buf);
+					pr_debug2("file: %s\n", buf);
+				}
+			}
 			pr_debug2(" = %d\n", fd);
 
 			if (evsel->bpf_fd >= 0) {

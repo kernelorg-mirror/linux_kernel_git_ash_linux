@@ -31,6 +31,9 @@ struct perf_evlist {
 	int		 nr_entries;
 	int		 nr_groups;
 	int		 nr_mmaps;
+	bool		 detached;
+	bool		 files;
+	bool		 overwrite;
 	bool		 enabled;
 	bool		 has_user_cpus;
 	size_t		 mmap_len;

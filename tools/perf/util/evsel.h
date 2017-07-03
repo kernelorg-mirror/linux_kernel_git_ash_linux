@@ -102,6 +102,7 @@ struct perf_evsel {
 	char			*name;
 	double			scale;
 	const char		*unit;
+	char			*detached_file;
 	struct event_format	*tp_format;
 	off_t			id_offset;
 	struct perf_stat_evsel  *stats;
@@ -115,6 +116,8 @@ struct perf_evsel {
 	unsigned int		sample_size;
 	int			id_pos;
 	int			is_pos;
+	int			detached_fd;
+	bool			detached;
 	bool			snapshot;
 	bool 			supported;
 	bool 			needs_swap;
