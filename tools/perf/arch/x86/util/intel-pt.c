@@ -360,7 +360,10 @@ static int intel_pt_info_fill(struct auxtrace_record *itr,
 	if (!session->evlist->nr_mmaps)
 		return -EINVAL;
 
-	pc = session->evlist->mmap[0].base;
+	if (session->evlist->overwrite_mmap)
+		pc = session->evlist->overwrite_mmap[0].base;
+	else
+		pc = session->evlist->mmap[0].base;
 	if (pc) {
 		err = perf_read_tsc_conversion(pc, &tc);
 		if (err) {
