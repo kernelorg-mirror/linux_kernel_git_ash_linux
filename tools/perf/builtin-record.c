@@ -307,11 +307,15 @@ static int record__mmap_evlist(struct record *rec,
 			       struct perf_evlist *evlist)
 {
 	struct record_opts *opts = &rec->opts;
+	bool auxtrace_overwrite = opts->auxtrace_snapshot_mode;
 	char msg[512];
+
+	if (evlist->files)
+		auxtrace_overwrite = true;
 
 	if (perf_evlist__mmap_ex(evlist, opts->mmap_pages,
 				 opts->auxtrace_mmap_pages,
-				 opts->auxtrace_snapshot_mode) < 0) {
+				 auxtrace_overwrite) < 0) {
 		if (errno == EPERM) {
 			pr_err("Permission error mapping pages.\n"
 			       "Consider increasing "
