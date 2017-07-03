@@ -84,8 +84,14 @@ int auxtrace_mmap__mmap(struct auxtrace_mmap *mm,
 	return -1;
 #endif
 
-	pc->aux_offset = mp->offset;
-	pc->aux_size = mp->len;
+	/*
+	 * can't (and shouldn't) write aux_{offset,size} in a DETACHED
+	 * situation, as those are already set (in stone)
+	 */
+	if (!pc->aux_size) {
+		pc->aux_offset = mp->offset;
+		pc->aux_size = mp->len;
+	}
 
 	mm->base = mmap(NULL, mp->len, mp->prot, MAP_SHARED, fd, mp->offset);
 	if (mm->base == MAP_FAILED) {
