@@ -149,7 +149,7 @@ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts,
 	if (opts->group)
 		perf_evlist__set_leader(evlist);
 
-	if (evlist->cpus->map[0] < 0)
+	if (evlist->cpus->map[0] < 0 && !opts->detached)
 		opts->no_inherit = true;
 
 	use_comm_exec = perf_can_comm_exec();
