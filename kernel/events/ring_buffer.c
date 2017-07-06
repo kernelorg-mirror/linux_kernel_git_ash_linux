@@ -268,10 +268,61 @@ void perf_output_end(struct perf_output_handle *handle)
 	rcu_read_unlock();
 }
 
+static void perf_event_init_pmu_info(struct perf_event *event,
+				     struct perf_event_mmap_page *userpg)
+{
+	const struct pmu_info_header *pih = NULL;
+	void *ptr = (void *)userpg + sizeof(*userpg);
+	size_t size = sizeof(event->attr);
+
+	if (event->pmu && event->pmu->pmu_info) {
+		pih = event->pmu->pmu_info;
+		size += pih->header_size;
+		size += pih->pmu_info_size;
+	}
+
+	if (size + sizeof(*userpg) > PAGE_SIZE)
+		return;
+
+	userpg->pmu_offset = offset_in_page(ptr);
+	userpg->pmu_size = size;
+
+	memcpy(ptr, &event->attr, sizeof(event->attr));
+	if (pih) {
+		ptr += sizeof(event->attr);
+		memcpy(ptr, (void *)pih, pih->header_size +
+		       pih->pmu_info_size);
+	}
+}
+
+static void perf_event_init_userpage(struct perf_event *event,
+				     struct ring_buffer *rb)
+{
+	struct perf_event_mmap_page *userpg;
+
+	userpg = rb->user_page;
+
+	/* Allow new userspace to detect that bit 0 is deprecated */
+	userpg->cap_bit0_is_deprecated = 1;
+	userpg->size = offsetof(struct perf_event_mmap_page, __reserved);
+	userpg->data_offset = PAGE_SIZE;
+	userpg->data_size = perf_data_size(rb);
+	if (event->attach_state & PERF_ATTACH_DETACHED) {
+		userpg->aux_offset =
+			(event->attr.detached_nr_pages + 1) << PAGE_SHIFT;
+		userpg->aux_size =
+			event->attr.detached_aux_nr_pages << PAGE_SHIFT;
+	}
+
+	perf_event_init_pmu_info(event, userpg);
+}
+
 static void
-ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
+ring_buffer_init(struct ring_buffer *rb, struct perf_event *event, int flags)
 {
 	long max_size = perf_data_size(rb);
+	long watermark =
+		event->attr.watermark ? event->attr.wakeup_watermark : 0;
 
 	if (watermark)
 		rb->watermark = min(max_size, watermark);
@@ -295,6 +346,8 @@ ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
 	 */
 	if (!rb->nr_pages)
 		rb->paused = 1;
+
+	perf_event_init_userpage(event, rb);
 }
 
 void perf_aux_output_flag(struct perf_output_handle *handle, u64 flags)
@@ -790,7 +843,7 @@ int rb_alloc_detached(struct perf_event *event)
 	 * Use overwrite mode (!RING_BUFFER_WRITABLE) for both data and aux
 	 * areas as we don't want wakeups or interrupts.
 	 */
-	rb = rb_alloc(NULL, nr_pages, 0, event->cpu, 0);
+	rb = rb_alloc(event, NULL, nr_pages, 0);
 	if (IS_ERR(rb))
 		return PTR_ERR(rb);
 
@@ -855,8 +908,8 @@ static void *perf_mmap_alloc_page(int cpu)
 	return page_address(page);
 }
 
-struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
-			     int cpu, int flags)
+struct ring_buffer *rb_alloc(struct perf_event *event, struct mm_struct *mm,
+			     int nr_pages, int flags)
 {
 	unsigned long size = offsetof(struct ring_buffer, data_pages[nr_pages]);
 	struct ring_buffer *rb;
@@ -864,26 +917,27 @@ struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
 
 	rb = kzalloc(size, GFP_KERNEL);
 	if (!rb)
-		goto fail;
+		return ERR_PTR(-ENOMEM);
 
 	ret = ring_buffer_account(rb, mm, nr_pages, false);
 	if (ret)
 		goto fail_free_rb;
 
 	ret = -ENOMEM;
-	rb->user_page = perf_mmap_alloc_page(cpu);
+	rb->user_page = perf_mmap_alloc_page(event->cpu);
 	if (!rb->user_page)
 		goto fail_unaccount;
 
 	for (i = 0; i < nr_pages; i++) {
-		rb->data_pages[i] = perf_mmap_alloc_page(cpu);
+		rb->data_pages[i] = perf_mmap_alloc_page(event->cpu);
+
 		if (!rb->data_pages[i])
 			goto fail_data_pages;
 	}
 
 	rb->nr_pages = nr_pages;
 
-	ring_buffer_init(rb, watermark, flags);
+	ring_buffer_init(rb, event, flags);
 
 	return rb;
 
@@ -899,7 +953,6 @@ fail_unaccount:
 fail_free_rb:
 	kfree(rb);
 
-fail:
 	return ERR_PTR(ret);
 }
 
@@ -967,8 +1020,8 @@ void rb_free(struct ring_buffer *rb)
 	schedule_work(&rb->work);
 }
 
-struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
-			     int cpu, int flags)
+struct ring_buffer *rb_alloc(struct perf_event *event, struct mm_struct *mm,
+			     int nr_pages, int flags)
 {
 	unsigned long size = offsetof(struct ring_buffer, data_pages[1]);
 	struct ring_buffer *rb;
@@ -997,7 +1050,7 @@ struct ring_buffer *rb_alloc(struct mm_struct *mm, int nr_pages, long watermark,
 		rb->page_order = ilog2(nr_pages);
 	}
 
-	ring_buffer_init(rb, watermark, flags);
+	ring_buffer_init(rb, event, flags);
 
 	return rb;
 

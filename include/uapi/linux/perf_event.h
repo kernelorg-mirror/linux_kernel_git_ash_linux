@@ -600,6 +600,16 @@ struct perf_event_mmap_page {
 	__u64	aux_tail;
 	__u64	aux_offset;
 	__u64	aux_size;
+
+	/*
+	 * PMU data: static info that (AUX) decoder wants to know in order to
+	 * decode correctly:
+	 *
+	 *   pmu_offset >= sizeof(struct perf_event_mmap_page)
+	 *   pmu_offset + pmu_size <= PAGE_SIZE
+	 */
+	__u64	pmu_offset;
+	__u64	pmu_size;
 };
 
 #define PERF_RECORD_MISC_CPUMODE_MASK		(7 << 0)
@@ -1088,6 +1098,18 @@ struct perf_branch_entry {
 		cycles:16,  /* cycle count to last branch */
 		type:4,     /* branch type */
 		reserved:40;
+};
+
+struct pmu_info_header {
+	/*
+	 * Size of this structure, for versioning.
+	 */
+	__u32	header_size;
+
+	/*
+	 * Size of the contained structure (not including this one)
+	 */
+	__u32	pmu_info_size;
 };
 
 #endif /* _UAPI_LINUX_PERF_EVENT_H */

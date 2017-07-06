@@ -82,7 +82,7 @@ static inline void rb_toggle_paused(struct ring_buffer *rb, bool pause)
 }
 
 extern struct ring_buffer *
-rb_alloc(struct mm_struct *mm, int nr_pages, long watermark, int cpu,
+rb_alloc(struct perf_event *event, struct mm_struct *mm, int nr_pages,
 	 int flags);
 extern void perf_event_wakeup(struct perf_event *event);
 extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,

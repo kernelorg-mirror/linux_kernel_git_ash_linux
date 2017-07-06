@@ -228,6 +228,8 @@ struct hw_perf_event {
 
 struct perf_event;
 
+struct pmu_info_header;
+
 /*
  * Common implementation detail of pmu::{start,commit,cancel}_txn
  */
@@ -278,6 +280,9 @@ struct pmu {
 
 	/* number of address filters this PMU can do */
 	unsigned int			nr_addr_filters;
+
+	/* PMU-specific data to append to the user page */
+	const struct pmu_info_header	*pmu_info;
 
 	/*
 	 * Fully disable/enable this PMU, can be used to protect from the PMI
