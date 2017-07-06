@@ -6466,6 +6466,29 @@ static void perf_event_addr_filters_exec(struct perf_event *event, void *data)
 		perf_event_stop(event, 1);
 }
 
+static void perf_shmem_ctx_exec(struct perf_event_context *ctx)
+{
+	struct perf_event *event;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&ctx->lock, flags);
+
+	list_for_each_entry(event, &ctx->event_list, event_entry) {
+		if (event->attach_state & PERF_ATTACH_SHMEM) {
+			struct ring_buffer *rb;
+
+			/* called inside rcu read section */
+			rb = rcu_dereference(event->rb);
+			if (!rb)
+				continue;
+
+			rb->shmem_file_addr = 0;
+		}
+	}
+
+	raw_spin_unlock_irqrestore(&ctx->lock, flags);
+}
+
 void perf_event_exec(void)
 {
 	struct perf_event_context *ctx;
@@ -6481,6 +6504,7 @@ void perf_event_exec(void)
 
 		perf_iterate_ctx(ctx, perf_event_addr_filters_exec, NULL,
 				   true);
+		perf_shmem_ctx_exec(ctx);
 	}
 	rcu_read_unlock();
 }
