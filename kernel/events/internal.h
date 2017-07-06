@@ -132,6 +132,12 @@ static inline unsigned long perf_aux_size(struct ring_buffer *rb)
 	return rb->aux_nr_pages << PAGE_SHIFT;
 }
 
+static inline bool is_detached_event(struct perf_event *event)
+{
+	lockdep_assert_held(&event->ctx->mutex);
+	return !!(event->attach_state & PERF_ATTACH_DETACHED);
+}
+
 #define __DEFINE_OUTPUT_COPY_BODY(advance_buf, memcpy_func, ...)	\
 {									\
 	unsigned long size, written;					\

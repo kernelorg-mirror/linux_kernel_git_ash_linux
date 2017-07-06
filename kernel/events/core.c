@@ -346,7 +346,8 @@ unlock:
 #define PERF_FLAG_ALL (PERF_FLAG_FD_NO_GROUP |\
 		       PERF_FLAG_FD_OUTPUT  |\
 		       PERF_FLAG_PID_CGROUP |\
-		       PERF_FLAG_FD_CLOEXEC)
+		       PERF_FLAG_FD_CLOEXEC |\
+		       PERF_FLAG_DETACHED)
 
 /*
  * branch priv levels that need permission checks
@@ -2031,6 +2032,16 @@ static void perf_set_shadow_time(struct perf_event *event,
 		perf_cgroup_set_shadow_time(event, event->tstamp);
 	else
 		event->shadow_ctx_time = event->tstamp - ctx->timestamp;
+}
+
+static const struct file_operations perf_fops;
+
+static int perf_event_detach(struct perf_event *event, struct task_struct *task,
+			     struct mm_struct *mm)
+{
+	int ret;
+
+	return perffs_create_event_file(event, task, &perf_fops);
 }
 
 #define MAX_INTERRUPTS (~0ULL)
@@ -4076,6 +4087,14 @@ static void _free_event(struct perf_event *event)
 
 	unaccount_event(event);
 
+	if (event->dent) {
+		perffs_remove(event->dent);
+	}
+
+	if (event->attach_state & PERF_ATTACH_DETACHED) {
+		event->attach_state &= ~PERF_ATTACH_DETACHED;
+	}
+
 	if (event->rb) {
 		/*
 		 * Can happen when we close an event with re-directed output.
@@ -4633,8 +4652,6 @@ static int perf_event_period(struct perf_event *event, u64 __user *arg)
 
 	return 0;
 }
-
-static const struct file_operations perf_fops;
 
 static inline int perf_fget_light(int fd, struct fd *p)
 {
@@ -5337,8 +5354,27 @@ static int perf_fasync(int fd, struct file *filp, int on)
 	return 0;
 }
 
+static int perf_open(struct inode *inode, struct file *file)
+{
+	struct perf_event *event = inode->i_private;
+	int ret;
+
+	if (WARN_ON_ONCE(!event))
+		return -EINVAL;
+
+	if (!atomic_long_inc_not_zero(&event->refcount))
+		return -ENOENT;
+
+	ret = simple_open(inode, file);
+	if (ret)
+		put_event(event);
+
+	return ret;
+}
+
 static const struct file_operations perf_fops = {
 	.llseek			= no_llseek,
+	.open			= perf_open,
 	.release		= perf_release,
 	.read			= perf_read,
 	.poll			= perf_poll,
@@ -9642,6 +9678,13 @@ perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 	struct ring_buffer *rb = NULL;
 	int ret = -EINVAL;
 
+	if (event->attach_state & PERF_ATTACH_DETACHED)
+		goto out;
+
+	if (output_event &&
+	    (output_event->attach_state & PERF_ATTACH_DETACHED))
+		goto out;
+
 	if (!output_event)
 		goto set;
 
@@ -9802,7 +9845,7 @@ SYSCALL_DEFINE5(perf_event_open,
 	struct task_struct *task = NULL;
 	struct pmu *pmu;
 	int event_fd;
-	int move_group = 0;
+	int move_group = 0, detached = 0;
 	int err;
 	int f_flags = O_RDWR;
 	int cgroup_fd = -1;
@@ -9880,6 +9923,16 @@ SYSCALL_DEFINE5(perf_event_open,
 	    group_leader->attr.inherit != attr.inherit) {
 		err = -EINVAL;
 		goto err_task;
+	}
+
+	if (flags & PERF_FLAG_DETACHED) {
+		err = -EINVAL;
+
+		/* output redirection and grouping are not allowed */
+		if (output_event || (group_fd != -1))
+			goto err_task;
+
+		detached = 1;
 	}
 
 	if (task) {
@@ -10030,6 +10083,16 @@ SYSCALL_DEFINE5(perf_event_open,
 		goto err_context;
 	}
 
+	if (detached) {
+		err = perf_event_detach(event, task, NULL);
+		if (err)
+			goto err_file;
+
+		atomic_long_inc(&event->refcount);
+
+		event_file->private_data = event;
+	}
+
 	if (move_group) {
 		gctx = __perf_event_ctx_lock_double(group_leader, ctx);
 
@@ -10162,7 +10225,7 @@ SYSCALL_DEFINE5(perf_event_open,
 	perf_event__header_size(event);
 	perf_event__id_header_size(event);
 
-	event->owner = current;
+	event->owner = detached ? TASK_TOMBSTONE : current;
 
 	perf_install_in_context(ctx, event, event->cpu);
 	perf_unpin_context(ctx);
@@ -10176,9 +10239,11 @@ SYSCALL_DEFINE5(perf_event_open,
 		put_task_struct(task);
 	}
 
-	mutex_lock(&current->perf_event_mutex);
-	list_add_tail(&event->owner_entry, &current->perf_event_list);
-	mutex_unlock(&current->perf_event_mutex);
+	if (!detached) {
+		mutex_lock(&current->perf_event_mutex);
+		list_add_tail(&event->owner_entry, &current->perf_event_list);
+		mutex_unlock(&current->perf_event_mutex);
+	}
 
 	/*
 	 * Drop the reference on the group_event after placing the
@@ -10191,10 +10256,12 @@ SYSCALL_DEFINE5(perf_event_open,
 	return event_fd;
 
 err_locked:
+	if (detached)
+		put_event(event);
 	if (move_group)
 		perf_event_ctx_unlock(group_leader, gctx);
 	mutex_unlock(&ctx->mutex);
-/* err_file: */
+err_file:
 	fput(event_file);
 err_context:
 	perf_unpin_context(ctx);
@@ -10418,7 +10485,16 @@ perf_event_exit_event(struct perf_event *child_event,
 	 * Parent events are governed by their filedesc, retain them.
 	 */
 	if (!parent_event) {
-		perf_event_wakeup(child_event);
+		/*
+		 * unless they are DETACHED, in which case we still have
+		 * to dispose of them; they have an extra reference with
+		 * the DETACHED state and a perffs file
+		 */
+		if (is_detached_event(child_event))
+			put_event(child_event); /* can be last */
+		else
+			perf_event_wakeup(child_event);
+
 		return;
 	}
 	/*

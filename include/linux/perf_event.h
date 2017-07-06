@@ -525,6 +525,7 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
 #define PERF_EV_CAP_SOFTWARE		BIT(0)
 #define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
 
+#define PERFFS_HASH_BITS		32
 #define SWEVENT_HLIST_BITS		8
 #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)
 
@@ -538,6 +539,7 @@ struct swevent_hlist {
 #define PERF_ATTACH_TASK	0x04
 #define PERF_ATTACH_TASK_DATA	0x08
 #define PERF_ATTACH_ITRACE	0x10
+#define PERF_ATTACH_DETACHED	0x20
 
 struct perf_cgroup;
 struct ring_buffer;
@@ -643,6 +645,8 @@ struct perf_event {
 
 	struct list_head		owner_entry;
 	struct task_struct		*owner;
+
+	struct dentry			*dent;
 
 	/* mmap bits */
 	struct mutex			mmap_mutex;
