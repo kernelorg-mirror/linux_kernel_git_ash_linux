@@ -256,11 +256,12 @@ static void event_function_call(struct perf_event *event, event_f func, void *da
 		.data = data,
 	};
 
-	if (!event->parent) {
+	if (!event->parent && !ctx->clone_disable) {
 		/*
 		 * If this is a !child event, we must hold ctx::mutex to
 		 * stabilize the the event->ctx relation. See
 		 * perf_event_ctx_lock().
+		 * Note: detached events' ctx is always stable.
 		 */
 		lockdep_assert_held(&ctx->mutex);
 	}
@@ -10090,6 +10091,7 @@ SYSCALL_DEFINE5(perf_event_open,
 		atomic_long_inc(&event->refcount);
 		atomic_inc(&event->mmap_count);
 
+		ctx->clone_disable = 1;
 		event_file->private_data = event;
 	}
 
@@ -10622,14 +10624,18 @@ static void perf_free_event(struct perf_event *event,
 {
 	struct perf_event *parent = event->parent;
 
-	if (WARN_ON_ONCE(!parent))
-		return;
+	/*
+	 * If a parentless event turns up here, it has to be a detached
+	 * event, in case of inherit_event() failure.
+	 */
 
-	mutex_lock(&parent->child_mutex);
-	list_del_init(&event->child_list);
-	mutex_unlock(&parent->child_mutex);
+	if (parent) {
+		mutex_lock(&parent->child_mutex);
+		list_del_init(&event->child_list);
+		mutex_unlock(&parent->child_mutex);
 
-	put_event(parent);
+		put_event(parent);
+	}
 
 	raw_spin_lock_irq(&ctx->lock);
 	perf_group_detach(event);
@@ -10726,6 +10732,7 @@ inherit_event(struct perf_event *parent_event,
 	      struct perf_event_context *child_ctx)
 {
 	enum perf_event_state parent_state = parent_event->state;
+	bool detached = is_detached_event(parent_event);
 	struct perf_event *child_event;
 	unsigned long flags;
 
@@ -10738,10 +10745,16 @@ inherit_event(struct perf_event *parent_event,
 	if (parent_event->parent)
 		parent_event = parent_event->parent;
 
+	/*
+	 * Detached events don't have parents; instead, inheritance
+	 * creates a new independent event, which is accessible via
+	 * tracefs.
+	 */
 	child_event = perf_event_alloc(&parent_event->attr,
 					   parent_event->cpu,
 					   child,
-					   group_leader, parent_event,
+					   group_leader,
+					   detached ? NULL : parent_event,
 					   NULL, NULL, -1);
 	if (IS_ERR(child_event))
 		return child_event;
@@ -10802,6 +10815,29 @@ inherit_event(struct perf_event *parent_event,
 		= parent_event->overflow_handler_context;
 
 	/*
+	 * For per-task detached events with ring buffers, set_output doesn't
+	 * make sense, but we can allocate a new buffer here. CPU-wide events
+	 * don't have inheritance.
+	 */
+	if (detached) {
+		int err;
+
+		err = perf_event_detach(child_event, child, NULL);
+		if (err) {
+			perf_free_event(child_event, child_ctx);
+			mutex_unlock(&parent_event->child_mutex);
+			put_event(parent_event);
+			return NULL;
+		}
+
+		/*
+		 * Inherited detached events don't use their parent's
+		 * ring buffer, so cloning can't work for them.
+		 */
+		child_ctx->clone_disable = 1;
+	}
+
+	/*
 	 * Precalculate sample_data sizes
 	 */
 	perf_event__header_size(child_event);
@@ -10815,10 +10851,16 @@ inherit_event(struct perf_event *parent_event,
 	raw_spin_unlock_irqrestore(&child_ctx->lock, flags);
 
 	/*
-	 * Link this into the parent event's child list
+	 * Link this into the parent event's child list, unless
+	 * it's a detached event, see above.
 	 */
-	list_add_tail(&child_event->child_list, &parent_event->child_list);
+	if (!detached)
+		list_add_tail(&child_event->child_list,
+			      &parent_event->child_list);
 	mutex_unlock(&parent_event->child_mutex);
+
+	if (detached)
+		put_event(parent_event);
 
 	return child_event;
 }
@@ -10979,7 +11021,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
 
 	child_ctx = child->perf_event_ctxp[ctxn];
 
-	if (child_ctx && inherited_all) {
+	if (child_ctx && inherited_all && !child_ctx->clone_disable) {
 		/*
 		 * Mark the child context as a clone of the parent
 		 * context, or of whatever the parent is a clone of.
