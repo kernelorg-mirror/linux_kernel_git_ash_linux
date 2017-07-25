@@ -8,6 +8,7 @@
 /* Buffer handling */
 
 #define RING_BUFFER_WRITABLE		0x01
+#define RING_BUFFER_SHMEM		0x02
 
 struct ring_buffer {
 	atomic_t			refcount;
@@ -53,6 +54,9 @@ struct ring_buffer {
 	void				**aux_pages;
 	void				*aux_priv;
 
+	/* tmpfs file for kernel-owned ring buffers */
+	struct file			*shmem_file;
+
 	struct perf_event_mmap_page	*user_page;
 	void				*data_pages[0];
 };
@@ -88,7 +92,9 @@ extern void perf_event_wakeup(struct perf_event *event);
 extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 			pgoff_t pgoff, int nr_pages, long watermark, int flags);
 extern void rb_free_aux(struct ring_buffer *rb);
-extern int rb_alloc_detached(struct perf_event *event);
+extern int rb_alloc_detached(struct perf_event *event,
+			     struct task_struct *task,
+			     struct mm_struct *mm);
 extern void rb_free_detached(struct ring_buffer *rb, struct perf_event *event);
 extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct ring_buffer *rb);

@@ -2042,13 +2042,15 @@ static int perf_event_detach(struct perf_event *event, struct task_struct *task,
 {
 	int ret;
 
-	ret = rb_alloc_detached(event);
+	ret = rb_alloc_detached(event, task, mm);
 	if (ret)
 		return ret;
 
-	ret = perffs_create_event_file(event, task, &perf_fops);
-	if (ret)
-		rb_free_detached(event->rb, event);
+	if (!(event->attach_state & PERF_ATTACH_SHMEM)) {
+		ret = perffs_create_event_file(event, task, &perf_fops);
+		if (ret)
+			rb_free_detached(event->rb, event);
+	}
 
 	return ret;
 }

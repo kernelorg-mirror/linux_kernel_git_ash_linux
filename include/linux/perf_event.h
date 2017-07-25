@@ -546,6 +546,7 @@ struct swevent_hlist {
 #define PERF_ATTACH_TASK_DATA	0x08
 #define PERF_ATTACH_ITRACE	0x10
 #define PERF_ATTACH_DETACHED	0x20
+#define PERF_ATTACH_SHMEM	0x40
 
 struct perf_cgroup;
 struct ring_buffer;
