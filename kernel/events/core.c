@@ -5389,7 +5389,8 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 	 * create a performance issue due to all children writing to the
 	 * same rb.
 	 */
-	if (event->cpu == -1 && event->attr.inherit)
+	if (event->cpu == -1 && event->attr.inherit &&
+	    !(event->attach_state & PERF_ATTACH_DETACHED))
 		return -EINVAL;
 
 	if (!(vma->vm_flags & VM_SHARED))
