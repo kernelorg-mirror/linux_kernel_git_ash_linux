@@ -50,6 +50,7 @@
 #include <linux/sched/mm.h>
 #include <linux/proc_ns.h>
 #include <linux/mount.h>
+#include <linux/task_work.h>
 
 #include "internal.h"
 
@@ -380,6 +381,7 @@ static atomic_t perf_sched_count;
 static DEFINE_PER_CPU(atomic_t, perf_cgroup_events);
 static DEFINE_PER_CPU(int, perf_sched_cb_usages);
 static DEFINE_PER_CPU(struct pmu_event_list, pmu_sb_events);
+static DEFINE_PER_CPU(struct perf_event *, shmem_events);
 
 static atomic_t nr_mmap_events __read_mostly;
 static atomic_t nr_comm_events __read_mostly;
@@ -2055,6 +2057,139 @@ static int perf_event_detach(struct perf_event *event, struct task_struct *task,
 	return ret;
 }
 
+static void __unpin_event_pages(struct perf_event *event,
+				struct perf_cpu_context *cpuctx,
+				struct perf_event_context *ctx,
+				void *info)
+{
+	if (!atomic_dec_and_test(&event->xpinned))
+		return;
+
+	/*
+	 * If this event happens to be running, we need to stop it before we
+	 * can pull the pages. Note that this will be happening if we allow
+	 * concurrent shmem events, which seems like a bad idea.
+	 */
+	if (READ_ONCE(event->state) == PERF_EVENT_STATE_ACTIVE)
+		event->pmu->stop(event, PERF_EF_UPDATE);
+
+	rb_put_kernel_pages(event->rb, false);
+}
+
+enum pin_event_t {
+	PIN_IN = 0,
+	PIN_NOP,
+};
+
+static enum pin_event_t pin_event_pages(struct perf_event *event)
+{
+	struct perf_event **pinned_event = this_cpu_ptr(&shmem_events);
+	struct perf_event *old_event = *pinned_event;
+
+	if (old_event == event) {
+		/* XXX: EXPLAIN me better: inject after exec */
+		if (!atomic_cmpxchg(&event->xpinned, 0, 1))
+			return PIN_IN;
+
+		return PIN_NOP;
+	}
+
+	if (old_event && old_event->state > PERF_EVENT_STATE_DEAD)
+		event_function_call(old_event, __unpin_event_pages, NULL);
+
+	*pinned_event = event;
+	if (atomic_inc_return(&event->xpinned) != 1)
+		return PIN_NOP;
+
+	return PIN_IN;
+}
+
+static int perf_event_shmem_setup(struct perf_event *event)
+{
+	struct perf_event_context *ctx;
+	struct task_struct *task;
+	int err;
+
+	if (!(event->attach_state & PERF_ATTACH_SHMEM))
+		return 0;
+
+	ctx = perf_event_ctx_lock(event);
+	task = ctx->task;
+
+	err = perffs_create_event_file(event, task, &perf_fops);
+	if (err)
+		goto out;
+
+	err = rb_shmem_setup(event, task);
+	if (err) {
+		perffs_remove(event->dent);
+		event->dent = NULL;
+	}
+
+out:
+	if (err)
+		rb_free_detached(event->rb, event);
+	perf_event_ctx_unlock(event, ctx);
+
+	return err;
+}
+
+static int perf_event_stop(struct perf_event *event, int restart);
+
+static void get_pages_work(struct callback_head *work)
+{
+	struct perf_event *event = container_of(work, struct perf_event, get_pages_work);
+	int ret;
+	struct ring_buffer *rb = event->rb;
+	int (*get_fn)(struct perf_event *event) = rb_get_kernel_pages;
+
+	work->func = NULL;
+
+	if (!rb || current->flags & PF_EXITING)
+		return;
+
+	if (!event->dent) {
+		ret = perf_event_shmem_setup(event);
+		if (ret)
+			return;
+	}
+
+	if (!rb->shmem_file_addr) {
+		get_fn = rb_inject;
+		if (atomic_cmpxchg(&event->xpinned, 1, 0)) {
+			/* XXX: EXPLAIN better: after exec() we need to put
+			 * the pages,
+			 * but we don't mmap them back if PIN_NOP */
+			rb_put_kernel_pages(rb, false);
+		}
+	}
+
+	if (pin_event_pages(event) == PIN_IN) {
+		ret = get_fn(event);
+	} else {
+		ret = 0;
+	}
+
+	if (!ret)
+		perf_event_stop(event, 1);
+}
+
+static int perf_event_queue_work(struct perf_event *event,
+				 struct task_struct *task)
+{
+	int ret;
+
+	if (event->get_pages_work.func)
+		return 0;
+
+	init_task_work(&event->get_pages_work, get_pages_work);
+	ret = task_work_add(task, &event->get_pages_work, true);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 #define MAX_INTERRUPTS (~0ULL)
 
 static void perf_log_throttle(struct perf_event *event, int enable);
@@ -2065,7 +2200,7 @@ event_sched_in(struct perf_event *event,
 		 struct perf_cpu_context *cpuctx,
 		 struct perf_event_context *ctx)
 {
-	int ret = 0;
+	int ret = 0, shmem =  event->attach_state & PERF_ATTACH_SHMEM;
 
 	lockdep_assert_held(&ctx->lock);
 
@@ -2097,12 +2232,20 @@ event_sched_in(struct perf_event *event,
 
 	perf_log_itrace_start(event);
 
-	if (event->pmu->add(event, PERF_EF_START)) {
+	/*
+	 * For shmem events pmu::start will fail because of
+	 * rb::aux_mmap_count==0, so skip the PERF_EF_START, but
+	 * queue the task work that will actually start it.
+	 */
+	if (event->pmu->add(event, shmem ? 0 : PERF_EF_START)) {
 		perf_event_set_state(event, PERF_EVENT_STATE_INACTIVE);
 		event->oncpu = -1;
 		ret = -EAGAIN;
 		goto out;
 	}
+
+	if (shmem)
+		perf_event_queue_work(event, ctx->task);
 
 	if (!is_software_event(event))
 		cpuctx->active_oncpu++;
@@ -4098,6 +4241,30 @@ static void _free_event(struct perf_event *event)
 
 	unaccount_event(event);
 
+	if (event->attach_state & PERF_ATTACH_SHMEM) {
+		struct perf_event_context *ctx = event->ctx;
+		int cpu;
+
+		atomic_set(&event->xpinned, 0);
+		for_each_possible_cpu(cpu) {
+			struct perf_event **pinned_event =
+				per_cpu_ptr(&shmem_events, cpu);
+
+			cmpxchg(pinned_event, event, NULL);
+		}
+
+		event->attach_state &= ~PERF_ATTACH_SHMEM;
+
+		/*
+		 * XXX: !ctx means event is still being created;
+		 * we can get here via tracefs file though
+		 */
+		if (ctx && ctx->task && ctx->task != TASK_TOMBSTONE)
+			task_work_cancel(ctx->task, get_pages_work);
+
+		rb_put_kernel_pages(event->rb, false);
+	}
+
 	if (event->dent) {
 		perffs_remove(event->dent);
 	}
@@ -4873,6 +5040,10 @@ void perf_event_update_userpage(struct perf_event *event)
 	rcu_read_lock();
 	rb = rcu_dereference(event->rb);
 	if (!rb)
+		goto unlock;
+
+	/* Don't bother with the file backed rb when it's inactive */
+	if (rb->shmem_file && rb->paused)
 		goto unlock;
 
 	/*
@@ -10609,6 +10780,8 @@ void perf_event_exit_task(struct task_struct *child)
 	}
 	mutex_unlock(&child->perf_event_mutex);
 
+	task_work_cancel(child, get_pages_work);
+
 	for_each_task_context_nr(ctxn)
 		perf_event_exit_task_context(child, ctxn);
 
@@ -10820,6 +10993,8 @@ inherit_event(struct perf_event *parent_event,
 	 * For per-task detached events with ring buffers, set_output doesn't
 	 * make sense, but we can allocate a new buffer here. CPU-wide events
 	 * don't have inheritance.
+	 * If we have to allocate a ring buffer, it must be shmem backed,
+	 * otherwise inheritance is disallowed in rb_alloc_detached().
 	 */
 	if (detached) {
 		int err;

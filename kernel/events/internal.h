@@ -56,11 +56,16 @@ struct ring_buffer {
 
 	/* tmpfs file for kernel-owned ring buffers */
 	struct file			*shmem_file;
+	unsigned long			shmem_file_addr;
+	int				shmem_pages_in;
 
 	struct perf_event_mmap_page	*user_page;
 	void				*data_pages[0];
 };
 
+extern int rb_inject(struct perf_event *event);
+extern int rb_get_kernel_pages(struct perf_event *event);
+extern void rb_put_kernel_pages(struct ring_buffer *rb, bool final);
 extern void rb_free(struct ring_buffer *rb);
 extern void ring_buffer_unaccount(struct ring_buffer *rb, bool aux);
 

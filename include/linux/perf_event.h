@@ -664,6 +664,13 @@ struct perf_event {
 	unsigned long			rcu_batches;
 	int				rcu_pending;
 
+	/*
+	 * Number of times (CPUs) this event's been pinned (on):
+	 *  xpinned -> 0: unpin the pages,
+	 *  xpinned -> 1: pin the pages. See get_pages_work().
+	 */
+	atomic_t			xpinned;
+
 	/* poll related */
 	wait_queue_head_t		waitq;
 	struct fasync_struct		*fasync;
@@ -695,6 +702,9 @@ struct perf_event {
 	perf_overflow_handler_t		orig_overflow_handler;
 	struct bpf_prog			*prog;
 #endif
+
+	/* Task work to pin event's rb pages if needed */
+	struct callback_head		get_pages_work;
 
 #ifdef CONFIG_EVENT_TRACING
 	struct trace_event_call		*tp_event;

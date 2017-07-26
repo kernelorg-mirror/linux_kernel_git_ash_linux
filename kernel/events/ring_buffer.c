@@ -15,6 +15,8 @@
 #include <linux/circ_buf.h>
 #include <linux/poll.h>
 #include <linux/shmem_fs.h>
+#include <linux/mman.h>
+#include <linux/sched/mm.h>
 
 #include "internal.h"
 
@@ -386,8 +388,11 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	unsigned long aux_head, aux_tail;
 	struct ring_buffer *rb;
 
-	if (output_event->parent)
+	if (output_event->parent) {
+		WARN_ON_ONCE(is_detached_event(event));
+		WARN_ON_ONCE(event->attach_state & PERF_ATTACH_SHMEM);
 		output_event = output_event->parent;
+	}
 
 	/*
 	 * Since this will typically be open across pmu::add/pmu::del, we
@@ -867,6 +872,64 @@ void rb_free_aux(struct ring_buffer *rb)
 	}
 }
 
+static unsigned long perf_rb_size(struct ring_buffer *rb)
+{
+	return perf_data_size(rb) + perf_aux_size(rb) + PAGE_SIZE;
+}
+
+int rb_inject(struct perf_event *event)
+{
+	struct ring_buffer *rb = event->rb;
+	struct mm_struct *mm;
+	unsigned long addr;
+	int err = -ENOMEM;
+
+	mm = get_task_mm(current);
+	if (!mm)
+		return -ESRCH;
+
+	err = rb_get_kernel_pages(event);
+	if (err)
+		goto err_mmput;
+
+	addr = vm_mmap(rb->shmem_file, 0, perf_rb_size(rb), PROT_READ,
+		       MAP_SHARED | MAP_POPULATE, 0);
+
+	mmput(mm);
+	rb->mmap_mapping = mm;
+	rb->shmem_file_addr = addr;
+
+	return 0;
+
+err_mmput:
+	mmput(mm);
+
+	return err;
+}
+
+static void rb_shmem_unmap(struct perf_event *event)
+{
+	struct ring_buffer *rb = event->rb;
+	struct mm_struct *mm = rb->mmap_mapping;
+
+	rb_toggle_paused(rb, true);
+
+	if (!rb->shmem_file_addr)
+		return;
+
+	/*
+	 * EXIT state means the task is past exit_mm(),
+	 * no need to unmap anything
+	 */
+	if (event->state == PERF_EVENT_STATE_EXIT)
+		return;
+
+	down_write(&mm->mmap_sem);
+	(void)do_munmap(mm, rb->shmem_file_addr, perf_rb_size(rb), NULL);
+	up_write(&mm->mmap_sem);
+	rb->shmem_file_addr = 0;
+}
+
 static int rb_shmem_setup(struct perf_event *event,
 			  struct task_struct *task,
 			  struct ring_buffer *rb)
@@ -905,6 +968,138 @@ static int rb_shmem_setup(struct perf_event *event,
 	event->attach_state |= PERF_ATTACH_SHMEM;
 
 	return 0;
+}
+
+/*
+ * Pin ring_buffer's pages to memory while the task is scheduled in;
+ * populate its page arrays (data_pages, aux_pages, user_page).
+ */
+int rb_get_kernel_pages(struct perf_event *event)
+{
+	struct ring_buffer *rb = event->rb;
+	struct address_space *mapping;
+	int nr_pages, i = 0, err = -EINVAL, changed = 0, mc = 0;
+	struct page *page;
+
+	/*
+	 * The mmap_count rules for SHMEM buffers:
+	 *  - they are always taken together
+	 *  - except for perf_mmap(), which doesn't work for shmem buffers:
+	 *    mmaping will force-pin more user's pages than is allowed
+	 *  - if either of them was taken before us, the pages are there
+	 */
+	if (atomic_inc_return(&rb->mmap_count) == 1)
+		mc++;
+
+	if (atomic_inc_return(&rb->aux_mmap_count) == 1)
+		mc++;
+
+	if (mc < 2)
+		goto done;
+
+	if (WARN_ON_ONCE(!rb->shmem_file))
+		goto err_put;
+
+	nr_pages = perf_rb_size(rb) >> PAGE_SHIFT;
+
+	mapping = rb->shmem_file->f_mapping;
+
+restart:
+	for (i = 0; i < nr_pages; i++) {
+		WRITE_ONCE(rb->shmem_pages_in, i);
+		err = shmem_getpage(mapping->host, i, &page, SGP_NOHUGE);
+		if (err)
+			goto err_put;
+
+		unlock_page(page);
+
+		if (READ_ONCE(rb->shmem_pages_in) != i) {
+			put_page(page);
+			goto restart;
+		}
+
+		mark_page_accessed(page);
+		set_page_dirty(page);
+		page->mapping = mapping;
+
+		if (page == perf_mmap_to_page(rb, i))
+			continue;
+
+		changed++;
+		if (!i) {
+			bool init = !rb->user_page;
+
+			rb->user_page = page_address(page);
+			if (init)
+				perf_event_init_userpage(event, rb);
+		} else if (i <= rb->nr_pages) {
+			rb->data_pages[i - 1] = page_address(page);
+		} else {
+			rb->aux_pages[i - rb->nr_pages - 1] = page_address(page);
+		}
+	}
+
+	/* rebuild SG tables: pages may have changed */
+	if (changed) {
+		if (rb->aux_priv)
+			rb->free_aux(rb->aux_priv);
+
+		rb->aux_priv = event->pmu->setup_aux(smp_processor_id(),
+						     rb->aux_pages,
+						     rb->aux_nr_pages, true);
+	}
+
+	if (!rb->aux_priv) {
+		err = -ENOMEM;
+		goto err_put;
+	}
+
+done:
+	rb_toggle_paused(rb, false);
+	if (changed)
+		perf_event_update_userpage(event);
+
+	return 0;
+
+err_put:
+	for (i--; i >= 0; i--) {
+		page = perf_mmap_to_page(rb, i);
+		put_page(page);
+	}
+
+	atomic_dec(&rb->aux_mmap_count);
+	atomic_dec(&rb->mmap_count);
+
+	return err;
+}
+
+void rb_put_kernel_pages(struct ring_buffer *rb, bool final)
+{
+	struct page *page;
+	int i;
+
+	if (!rb || !rb->shmem_file)
+		return;
+
+	rb_toggle_paused(rb, true);
+
+	/*
+	 * If both mmap_counts go to zero, put the pages, otherwise
+	 * do nothing.
+	 */
+	if (!atomic_dec_and_test(&rb->aux_mmap_count) ||
+	    !atomic_dec_and_test(&rb->mmap_count))
+		return;
+
+	for (i = 0; i < READ_ONCE(rb->shmem_pages_in); i++) {
+		page = perf_mmap_to_page(rb, i);
+		set_page_dirty(page);
+		if (final)
+			page->mapping = NULL;
+		put_page(page);
+	}
+
+	WRITE_ONCE(rb->shmem_pages_in, 0);
 }
 
 /*
@@ -977,8 +1172,11 @@ void rb_free_detached(struct ring_buffer *rb, struct perf_event *event)
 	/* Must be the last one */
 	WARN_ON_ONCE(atomic_read(&rb->refcount) != 1);
 
-	if (rb->shmem_file)
+	if (rb->shmem_file) {
+		rb_shmem_unmap(event);
 		shmem_truncate_range(rb->shmem_file->f_inode, 0, (loff_t)-1);
+		rb_put_kernel_pages(rb, true);
+	}
 
 	atomic_set(&rb->aux_mmap_count, 0);
 	rcu_assign_pointer(event->rb, NULL);
