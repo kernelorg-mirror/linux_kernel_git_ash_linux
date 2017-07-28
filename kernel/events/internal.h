@@ -54,6 +54,8 @@ struct ring_buffer {
 	void				**aux_pages;
 	void				*aux_priv;
 
+	atomic_t			*acct_refcount;
+
 	/* tmpfs file for kernel-owned ring buffers */
 	struct file			*shmem_file;
 	unsigned long			shmem_file_addr;
@@ -99,7 +101,8 @@ extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 extern void rb_free_aux(struct ring_buffer *rb);
 extern int rb_alloc_detached(struct perf_event *event,
 			     struct task_struct *task,
-			     struct mm_struct *mm);
+			     struct mm_struct *mm,
+			     struct ring_buffer *parent_rb);
 extern void rb_free_detached(struct ring_buffer *rb, struct perf_event *event);
 extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct ring_buffer *rb);

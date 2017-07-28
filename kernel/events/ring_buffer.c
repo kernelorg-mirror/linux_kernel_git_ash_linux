@@ -586,8 +586,8 @@ EXPORT_SYMBOL_GPL(perf_get_aux);
  * error out. Otherwise, keep track of the pages used in the ring_buffer so
  * that the accounting can be undone when the pages are freed.
  */
-static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
-			       unsigned long nr_pages, bool aux)
+static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
+                                 unsigned long nr_pages, unsigned long *locked)
 {
 	unsigned long total, limit, pinned;
 
@@ -604,6 +604,9 @@ static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 	limit *= num_online_cpus();
 
 	total = atomic_long_read(&rb->mmap_user->locked_vm) + nr_pages;
+
+	free_uid(rb->mmap_user);
+	rb->mmap_user = NULL;
 
 	pinned = 0;
 	if (total > limit) {
@@ -625,25 +628,31 @@ static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 			return -EPERM;
 		}
 
-		if (aux)
-			rb->aux_mmap_locked = pinned;
-		else
-			rb->mmap_locked = pinned;
-
+		*locked = pinned;
 		mm->pinned_vm += pinned;
 	}
 
 	if (!rb->mmap_mapping)
 		rb->mmap_mapping = mm;
 
-	/* account for user page */
-	if (!aux)
-		nr_pages++;
-
 	rb->mmap_user = get_current_user();
 	atomic_long_add(nr_pages, &rb->mmap_user->locked_vm);
 
 	return 0;
+}
+
+static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
+			       unsigned long nr_pages, bool aux)
+{
+	int ret;
+
+	/* account for user page */
+	if (!aux)
+		nr_pages++;
+	ret = __ring_buffer_account(rb, mm, nr_pages,
+	                            aux ? &rb->aux_mmap_locked : &rb->mmap_locked);
+
+	return ret;
 }
 
 /*
@@ -655,6 +664,9 @@ void ring_buffer_unaccount(struct ring_buffer *rb, bool aux)
 	unsigned long pinned = aux ? rb->aux_mmap_locked : rb->mmap_locked;
 
 	if (!rb->nr_pages && !rb->aux_nr_pages)
+		return;
+
+	if (WARN_ON_ONCE(!rb->mmap_user))
 		return;
 
 	atomic_long_sub(nr_pages, &rb->mmap_user->locked_vm);
@@ -866,7 +878,8 @@ out:
 void rb_free_aux(struct ring_buffer *rb)
 {
 	if (atomic_dec_and_test(&rb->aux_refcount)) {
-		ring_buffer_unaccount(rb, true);
+		if (!rb->shmem_file)
+			ring_buffer_unaccount(rb, true);
 
 		__rb_free_aux(rb);
 	}
@@ -1103,12 +1116,67 @@ void rb_put_kernel_pages(struct ring_buffer *rb, bool final)
 }
 
 /*
+ * SHMEM memory is accounted once per user allocated event (via
+ * the syscall), since we can have at most NR_CPUS * nr_pages
+ * pinned pages at any given point in time, regardless of how
+ * many events there actually are.
+ *
+ * The first one (parent_rb==NULL) is where we do the accounting;
+ * it will also be the one coming from the syscall, so if it fails,
+ * we'll hand them back the error.
+ * Others just inherit and bump the counter; can't fail.
+ */
+static int
+rb_shmem_account(struct ring_buffer *rb, struct ring_buffer *parent_rb)
+{
+	unsigned long nr_pages = perf_rb_size(rb) >> PAGE_SHIFT;
+	int ret = 0;
+
+	if (parent_rb) {
+		/* "parent" rb *must* have accounting refcounter */
+		if (WARN_ON_ONCE(!parent_rb->acct_refcount))
+			return -EINVAL;
+
+		rb->acct_refcount = parent_rb->acct_refcount;
+		atomic_inc(rb->acct_refcount);
+
+		return 0;
+	}
+
+	/* All (data + aux + user page) in one go */
+	ret = __ring_buffer_account(rb, NULL, nr_pages,
+	                            &rb->mmap_locked);
+	if (ret)
+		return ret;
+
+	rb->acct_refcount = kmalloc(sizeof(*rb->acct_refcount),
+	                            GFP_KERNEL);
+	if (!rb->acct_refcount)
+		return -ENOMEM;
+
+	atomic_set(rb->acct_refcount, 1);
+
+	return 0;
+}
+
+static void rb_shmem_unaccount(struct ring_buffer *rb)
+{
+	if (!atomic_dec_and_test(rb->acct_refcount)) {
+		rb->acct_refcount = NULL;
+		return;
+	}
+
+	ring_buffer_unaccount(rb, false);
+	kfree(rb->acct_refcount);
+}
+
+/*
  * Allocate a ring_buffer for a detached event and attach it to this event.
  * There's one ring_buffer per detached event and vice versa, so
  * ring_buffer_attach() does not apply.
  */
 int rb_alloc_detached(struct perf_event *event, struct task_struct *task,
-		      struct mm_struct *mm)
+		      struct mm_struct *mm, struct ring_buffer *parent_rb)
 {
 	int aux_nr_pages = event->attr.detached_aux_nr_pages;
 	int nr_pages = event->attr.detached_nr_pages;
@@ -1131,18 +1199,22 @@ int rb_alloc_detached(struct perf_event *event, struct task_struct *task,
 	if (IS_ERR(rb))
 		return PTR_ERR(rb);
 
-	if (aux_nr_pages) {
-		ret = rb_alloc_aux(rb, event, pgoff, aux_nr_pages, 0, flags);
+	if (flags & RING_BUFFER_SHMEM) {
+		ret = rb_shmem_account(rb, parent_rb);
 		if (ret)
 			goto err_free;
 	}
 
+	if (aux_nr_pages) {
+		ret = rb_alloc_aux(rb, event, pgoff, aux_nr_pages, 0, flags);
+		if (ret)
+			goto err_unaccount;
+	}
+
 	if (flags & RING_BUFFER_SHMEM) {
 		ret = rb_shmem_setup(event, task, rb);
-		if (ret) {
-			rb_free_aux(rb);
-			goto err_free;
-		}
+		if (ret)
+			goto err_free_aux;
 
 		rb_toggle_paused(rb, true);
 	} else {
@@ -1161,8 +1233,19 @@ int rb_alloc_detached(struct perf_event *event, struct task_struct *task,
 
 	return 0;
 
+err_free_aux:
+	if (!(flags & RING_BUFFER_SHMEM))
+		rb_free_aux(rb);
+
+err_unaccount:
+	if (flags & RING_BUFFER_SHMEM)
+		rb_shmem_unaccount(rb);
+
 err_free:
-	rb_free(rb);
+	if (flags & RING_BUFFER_SHMEM)
+		kfree(rb);
+	else
+		rb_free(rb);
 
 	return ret;
 }
@@ -1176,7 +1259,12 @@ void rb_free_detached(struct ring_buffer *rb, struct perf_event *event)
 		rb_shmem_unmap(event);
 		shmem_truncate_range(rb->shmem_file->f_inode, 0, (loff_t)-1);
 		rb_put_kernel_pages(rb, true);
+	} else {
+		ring_buffer_unaccount(rb, false);
 	}
+
+	if (event->attach_state & PERF_ATTACH_SHMEM)
+		rb_shmem_unaccount(rb);
 
 	atomic_set(&rb->aux_mmap_count, 0);
 	rcu_assign_pointer(event->rb, NULL);

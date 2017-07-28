@@ -2039,12 +2039,14 @@ static void perf_set_shadow_time(struct perf_event *event,
 
 static const struct file_operations perf_fops;
 
-static int perf_event_detach(struct perf_event *event, struct task_struct *task,
-			     struct mm_struct *mm)
+static int perf_event_detach(struct perf_event *event,
+			     struct perf_event *parent_event,
+			     struct task_struct *task, struct mm_struct *mm)
 {
+	struct ring_buffer *parent_rb = parent_event ? parent_event->rb : NULL;
 	int ret;
 
-	ret = rb_alloc_detached(event, task, mm);
+	ret = rb_alloc_detached(event, task, mm, parent_rb);
 	if (ret)
 		return ret;
 
@@ -4272,7 +4274,6 @@ static void _free_event(struct perf_event *event)
 	if (event->attach_state & PERF_ATTACH_DETACHED) {
 		event->attach_state &= ~PERF_ATTACH_DETACHED;
 
-		ring_buffer_unaccount(event->rb, false);
 		rb_free_detached(event->rb, event);
 	}
 
@@ -10257,7 +10258,7 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (pmu->capabilities & PERF_PMU_CAP_NO_DETACHED)
 			goto err_file;
 
-		err = perf_event_detach(event, task, NULL);
+		err = perf_event_detach(event, NULL, task, NULL);
 		if (err)
 			goto err_file;
 
@@ -10999,7 +11000,8 @@ inherit_event(struct perf_event *parent_event,
 	if (detached) {
 		int err;
 
-		err = perf_event_detach(child_event, child, NULL);
+		err = perf_event_detach(child_event, parent_event, child,
+					NULL);
 		if (err) {
 			perf_free_event(child_event, child_ctx);
 			mutex_unlock(&parent_event->child_mutex);
