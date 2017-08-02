@@ -6,6 +6,7 @@
 #include <linux/atomic.h>
 
 struct key;
+struct perf_event;
 
 /*
  * Some day this will be a full-fledged user tracking system..
@@ -40,6 +41,11 @@ struct user_struct {
 #if defined(CONFIG_PERF_EVENTS) || defined(CONFIG_BPF_SYSCALL) || \
     defined(CONFIG_NET)
 	atomic_long_t locked_vm;
+#endif
+#ifdef CONFIG_PERF_EVENTS
+	atomic_long_t nr_pinnable_events;
+	struct mutex pinned_mutex;
+	struct perf_event ** __percpu pinned_events;
 #endif
 };
 

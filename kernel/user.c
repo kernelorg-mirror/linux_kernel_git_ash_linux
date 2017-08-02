@@ -191,6 +191,7 @@ struct user_struct *alloc_uid(kuid_t uid)
 
 		new->uid = uid;
 		atomic_set(&new->__count, 1);
+		mutex_init(&new->pinned_mutex);
 
 		/*
 		 * Before adding this, check whether we raced

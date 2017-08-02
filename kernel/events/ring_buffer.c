@@ -579,6 +579,44 @@ void *perf_get_aux(struct perf_output_handle *handle)
 }
 EXPORT_SYMBOL_GPL(perf_get_aux);
 
+static struct user_struct *get_users_pinned_events(void)
+{
+	struct user_struct *user = current_user(), *ret = NULL;
+
+	if (atomic_long_inc_not_zero(&user->nr_pinnable_events))
+		return user;
+
+	mutex_lock(&user->pinned_mutex);
+	if (!atomic_long_read(&user->nr_pinnable_events)) {
+		if (WARN_ON_ONCE(!!user->pinned_events))
+			goto unlock;
+
+		user->pinned_events = alloc_percpu(struct perf_event *);
+		if (!user->pinned_events) {
+			goto unlock;
+		} else {
+			atomic_long_inc(&user->nr_pinnable_events);
+			ret = get_current_user();
+		}
+	}
+
+unlock:
+	mutex_unlock(&user->pinned_mutex);
+
+	return ret;
+}
+
+static void put_users_pinned_events(struct user_struct *user)
+{
+	if (!atomic_long_dec_and_test(&user->nr_pinnable_events))
+		return;
+
+	mutex_lock(&user->pinned_mutex);
+	free_percpu(user->pinned_events);
+	user->pinned_events = NULL;
+	mutex_unlock(&user->pinned_mutex);
+}
+
 /*
  * Check if the current user can afford @nr_pages, considering the
  * perf_event_mlock sysctl and their mlock limit. If the former is exceeded,
@@ -590,11 +628,14 @@ static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
                                  unsigned long nr_pages, unsigned long *locked)
 {
 	unsigned long total, limit, pinned;
+	struct user_struct *user;
 
 	if (!mm)
 		mm = rb->mmap_mapping;
 
-	rb->mmap_user = current_user();
+	user = get_users_pinned_events();
+	if (!user)
+		return -ENOMEM;
 
 	limit = sysctl_perf_event_mlock >> (PAGE_SHIFT - 10);
 
@@ -603,10 +644,7 @@ static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 	 */
 	limit *= num_online_cpus();
 
-	total = atomic_long_read(&rb->mmap_user->locked_vm) + nr_pages;
-
-	free_uid(rb->mmap_user);
-	rb->mmap_user = NULL;
+	total = atomic_long_read(&user->locked_vm) + nr_pages;
 
 	pinned = 0;
 	if (total > limit) {
@@ -615,7 +653,7 @@ static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 		 * limit needs to be accounted to the consumer's mm.
 		 */
 		if (!mm)
-			return -EPERM;
+			goto err_put_user;
 
 		pinned = total - limit;
 
@@ -624,9 +662,8 @@ static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 		total = mm->pinned_vm + pinned;
 
 		if ((total > limit) && perf_paranoid_tracepoint_raw() &&
-		    !capable(CAP_IPC_LOCK)) {
-			return -EPERM;
-		}
+		    !capable(CAP_IPC_LOCK))
+			goto err_put_user;
 
 		*locked = pinned;
 		mm->pinned_vm += pinned;
@@ -635,10 +672,15 @@ static int __ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
 	if (!rb->mmap_mapping)
 		rb->mmap_mapping = mm;
 
-	rb->mmap_user = get_current_user();
-	atomic_long_add(nr_pages, &rb->mmap_user->locked_vm);
+	rb->mmap_user = user;
+	atomic_long_add(nr_pages, &user->locked_vm);
 
 	return 0;
+
+err_put_user:
+	put_users_pinned_events(user);
+
+	return -EPERM;
 }
 
 static int ring_buffer_account(struct ring_buffer *rb, struct mm_struct *mm,
@@ -673,7 +715,7 @@ void ring_buffer_unaccount(struct ring_buffer *rb, bool aux)
 	if (rb->mmap_mapping)
 		rb->mmap_mapping->pinned_vm -= pinned;
 
-	free_uid(rb->mmap_user);
+	put_users_pinned_events(rb->mmap_user);
 }
 
 #define PERF_AUX_GFP	(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY)
@@ -1139,6 +1181,7 @@ rb_shmem_account(struct ring_buffer *rb, struct ring_buffer *parent_rb)
 
 		rb->acct_refcount = parent_rb->acct_refcount;
 		atomic_inc(rb->acct_refcount);
+		rb->mmap_user = get_uid(parent_rb->mmap_user);
 
 		return 0;
 	}
@@ -1161,6 +1204,8 @@ rb_shmem_account(struct ring_buffer *rb, struct ring_buffer *parent_rb)
 
 static void rb_shmem_unaccount(struct ring_buffer *rb)
 {
+	free_uid(rb->mmap_user);
+
 	if (!atomic_dec_and_test(rb->acct_refcount)) {
 		rb->acct_refcount = NULL;
 		return;
