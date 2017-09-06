@@ -56,6 +56,9 @@ struct ring_buffer {
 	void				*data_pages[0];
 };
 
+typedef unsigned long (*aux_copyfn)(void *data, const void *src,
+				    unsigned long len);
+
 extern void rb_free(struct ring_buffer *rb);
 
 static inline void rb_free_rcu(struct rcu_head *rcu_head)
@@ -80,6 +83,8 @@ extern void perf_event_wakeup(struct perf_event *event);
 extern int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 			pgoff_t pgoff, int nr_pages, long watermark, int flags);
 extern void rb_free_aux(struct ring_buffer *rb);
+extern long rb_output_aux(struct ring_buffer *rb, unsigned long from,
+			  unsigned long to, aux_copyfn copyfn, void *data);
 extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct ring_buffer *rb);
 
