@@ -44,11 +44,42 @@
 #define MSR_RTIT_EVENTS			0x0000076c
 #define RTIT_EVENTS_FILTER_OFFSET	0
 #define RTIT_EVENTS_TRACESTOP_OFFSET	3
-#define RTIT_EVENTS_ALWAYS_OFF		6
-#define RTIT_EVENTS_ALWAYS_ON		7
 #define MSR_RTIT_BASE_ADDR		0x00000770
 #define MSR_RTIT_LIMIT_MASK		0x00000771
 #define MSR_RTIT_OFFSET			0x00000772
+#define MSR_RTIT_LIP0			0x00000760
+#define MSR_RTIT_LIP1			0x00000761
+#define MSR_RTIT_LIP2			0x00000762
+#define MSR_RTIT_LIP3			0x00000763
+
+enum {
+	RTIT_EVENTS_RANGE0	= 0,
+	RTIT_EVENTS_RANGE1,
+	RTIT_EVENTS_RANGE_BOTH,
+	RTIT_EVENTS_ALWAYS_OFF	= 6,
+	RTIT_EVENTS_ALWAYS_ON,
+};
+
+enum {
+	EVT_FILTER = 0,
+	EVT_STOP,
+	EVT_MAX,
+};
+
+static const unsigned int evt_config[EVT_MAX][4] = {
+	{ /* Filter */
+		RTIT_EVENTS_ALWAYS_ON  << RTIT_EVENTS_FILTER_OFFSET,
+		RTIT_EVENTS_RANGE0     << RTIT_EVENTS_FILTER_OFFSET,
+		RTIT_EVENTS_RANGE1     << RTIT_EVENTS_FILTER_OFFSET,
+		RTIT_EVENTS_RANGE_BOTH << RTIT_EVENTS_FILTER_OFFSET,
+	},
+	{ /* TraceStop */
+		RTIT_EVENTS_ALWAYS_OFF << RTIT_EVENTS_TRACESTOP_OFFSET,
+		RTIT_EVENTS_RANGE0     << RTIT_EVENTS_TRACESTOP_OFFSET,
+		RTIT_EVENTS_RANGE1     << RTIT_EVENTS_TRACESTOP_OFFSET,
+		RTIT_EVENTS_RANGE_BOTH << RTIT_EVENTS_TRACESTOP_OFFSET,
+	},
+};
 
 struct rtit_buffer {
 	void		*buf;
@@ -58,12 +89,28 @@ struct rtit_buffer {
 	void		**data_pages;
 };
 
+#define RTIT_FILTERS_NUM 2
+
+struct rtit_filter {
+	unsigned long	msr_a;
+	unsigned long	msr_b;
+	unsigned	what;
+};
+
+struct rtit_filters {
+	struct rtit_filter	filter[RTIT_FILTERS_NUM];
+	u64			rtit_event;
+	unsigned int		nr_filters;
+};
+
 /**
  * struct rtit - per-cpu rtit context
  * @handle:	perf output handle
+ * @filters:	address range filtering configuration
  */
 struct rtit {
 	struct perf_output_handle handle;
+	struct rtit_filters	filters;
 };
 
 static DEFINE_PER_CPU(struct rtit, rtit_ctx);
@@ -136,6 +183,69 @@ static void rtit_buffer_free_aux(void *data)
 	kfree(buf);
 }
 
+static const struct rtit_address_range {
+	unsigned long	msr_a;
+	unsigned long	msr_b;
+} rtit_address_ranges[] = {
+	{
+		.msr_a		= MSR_RTIT_LIP0,
+		.msr_b		= MSR_RTIT_LIP2,
+	},
+	{
+		.msr_a		= MSR_RTIT_LIP1,
+		.msr_b		= MSR_RTIT_LIP3,
+	},
+};
+
+static void rtit_config_filters(struct perf_event *event)
+{
+	struct rtit_filters *filters = event->hw.addr_filters;
+	struct rtit *rtit = this_cpu_ptr(&rtit_ctx);
+	int actions[EVT_MAX] = { 0, 0 };
+	unsigned int range, act;
+	u64 rtit_event = 0;
+
+	if (!filters)
+		goto done;
+
+	perf_event_addr_filters_sync(event);
+
+	for (range = 0; range < filters->nr_filters; range++) {
+		struct rtit_filter *filter = &filters->filter[range];
+
+		/*
+		 * Note, if the range has zero start/end addresses due
+		 * to its dynamic object not being loaded yet, we just
+		 * go ahead and program zeroed range, which will simply
+		 * produce no data. Note^2: if executable code at 0x0
+		 * is a concern, we can set up an "invalid" configuration
+		 * such as msr_b < msr_a.
+		 */
+
+		/* avoid redundant msr writes */
+		if (rtit->filters.filter[range].msr_a != filter->msr_a) {
+			wrmsrl(rtit_address_ranges[range].msr_a, filter->msr_a);
+			rtit->filters.filter[range].msr_a = filter->msr_a;
+		}
+
+		if (rtit->filters.filter[range].msr_b != filter->msr_b) {
+			wrmsrl(rtit_address_ranges[range].msr_b, filter->msr_b);
+			rtit->filters.filter[range].msr_b = filter->msr_b;
+		}
+
+		actions[rtit->filters.filter[range].what] |= BIT(range);
+	}
+
+done:
+	for (act = 0; act < EVT_MAX; act++)
+		rtit_event |= evt_config[act][actions[act]];
+
+	if (rtit->filters.rtit_event != rtit_event) {
+		wrmsrl(MSR_RTIT_EVENTS, rtit_event);
+		rtit->filters.rtit_event = rtit_event;
+	}
+}
+
 static void rtit_config_stop(struct perf_event *event)
 {
 	u64 ctl = READ_ONCE(event->hw.config);
@@ -166,30 +276,114 @@ static void rtit_config_stop(struct perf_event *event)
 
 static void rtit_config(struct perf_event *event, struct rtit_buffer *buf)
 {
-	u64 reg;
+	u64 rtit_ctl;
 
-	/* set up filtering and TraceStop */
-	reg =
-		RTIT_EVENTS_ALWAYS_ON << RTIT_EVENTS_FILTER_OFFSET |
-		RTIT_EVENTS_ALWAYS_OFF << RTIT_EVENTS_TRACESTOP_OFFSET;
-	wrmsrl(MSR_RTIT_EVENTS, reg);
+	rtit_config_filters(event);
 
 	/* configure buffer address and size and write cursor*/
 	wrmsrl(MSR_RTIT_BASE_ADDR, virt_to_phys(buf->data_pages[0]));
 	wrmsrl(MSR_RTIT_LIMIT_MASK, (buf->nr_pages << PAGE_SHIFT) - 1);
 	wrmsrl(MSR_RTIT_OFFSET, local_read(&buf->head));
 
-	reg = RTIT_CTL_DRAM | RTIT_CTL_TRACEEN | RTIT_CTL_TRACEACTIVE;
+	rtit_ctl = RTIT_CTL_DRAM | RTIT_CTL_TRACEEN | RTIT_CTL_TRACEACTIVE;
 
 	if (!event->attr.exclude_kernel)
-		reg |= RTIT_CTL_OS;
+		rtit_ctl |= RTIT_CTL_OS;
 	if (!event->attr.exclude_user)
-		reg |= RTIT_CTL_USR;
+		rtit_ctl |= RTIT_CTL_USR;
 
-	reg |= (event->attr.config & RTIT_CONFIG_MASK);
-	WRITE_ONCE(event->hw.config, reg);
+	rtit_ctl |= (event->attr.config & RTIT_CONFIG_MASK);
+	WRITE_ONCE(event->hw.config, rtit_ctl);
 
-	wrmsrl(MSR_RTIT_CTL, reg);
+	wrmsrl(MSR_RTIT_CTL, rtit_ctl);
+}
+
+static int rtit_addr_filters_init(struct perf_event *event)
+{
+	struct rtit_filters *filters;
+	int node = event->cpu == -1 ? -1 : cpu_to_node(event->cpu);
+
+	filters = kzalloc_node(sizeof(struct rtit_filters), GFP_KERNEL, node);
+	if (!filters)
+		return -ENOMEM;
+
+	if (event->parent)
+		memcpy(filters, event->parent->hw.addr_filters,
+		       sizeof(*filters));
+
+	event->hw.addr_filters = filters;
+
+	return 0;
+}
+
+static void rtit_addr_filters_fini(struct perf_event *event)
+{
+	kfree(event->hw.addr_filters);
+	event->hw.addr_filters = NULL;
+}
+
+static inline bool valid_kernel_ip(unsigned long ip)
+{
+	return virt_addr_valid(ip) && kernel_ip(ip);
+}
+
+static int rtit_event_addr_filters_validate(struct list_head *filters)
+{
+	struct perf_addr_filter *filter;
+	int range = 0;
+
+	list_for_each_entry(filter, filters, entry) {
+		/* RTIT doesn't support single address triggers */
+		if (!filter->size ||
+		    filter->action == PERF_ADDR_FILTER_ACTION_START)
+			return -EOPNOTSUPP;
+
+		if (!filter->path.dentry) {
+			if (!valid_kernel_ip(filter->offset))
+				return -EINVAL;
+
+			if (!valid_kernel_ip(filter->offset + filter->size))
+				return -EINVAL;
+		}
+
+		if (++range > RTIT_FILTERS_NUM)
+			return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static void rtit_event_addr_filters_sync(struct perf_event *event)
+{
+	struct perf_addr_filters_head *head = perf_event_addr_filters(event);
+	struct perf_addr_filter_range *fr = event->addr_filter_ranges;
+	struct rtit_filters *filters = event->hw.addr_filters;
+	struct perf_addr_filter *filter;
+	unsigned long msr_a, msr_b;
+	int range = 0;
+
+	if (!filters)
+		return;
+
+	list_for_each_entry(filter, &head->list, entry) {
+		if (filter->path.dentry && !fr[range].start) {
+			msr_a = msr_b = 0;
+		} else {
+			/* apply the offset */
+			msr_a = fr[range].start;
+			msr_b = fr[range].size + msr_a - 1;
+		}
+
+		filters->filter[range].msr_a  = msr_a;
+		filters->filter[range].msr_b  = msr_b;
+		if (filter->action == PERF_ADDR_FILTER_ACTION_FILTER)
+			filters->filter[range].what = EVT_FILTER;
+		else
+			filters->filter[range].what = EVT_STOP;
+		range++;
+	}
+
+	filters->nr_filters = range;
 }
 
 /*
@@ -296,6 +490,7 @@ static void rtit_event_read(struct perf_event *event)
 
 static void rtit_event_destroy(struct perf_event *event)
 {
+	rtit_addr_filters_fini(event);
 	x86_del_exclusive(x86_lbr_exclusive_pt);
 }
 
@@ -306,6 +501,11 @@ static int rtit_event_init(struct perf_event *event)
 
 	if (x86_add_exclusive(x86_lbr_exclusive_pt))
 		return -EBUSY;
+
+	if (rtit_addr_filters_init(event)) {
+		x86_del_exclusive(x86_lbr_exclusive_pt);
+		return -ENOMEM;
+	}
 
 	event->destroy = rtit_event_destroy;
 
@@ -350,6 +550,9 @@ static __init int rtit_init(void)
 	rtit_pmu.read		= rtit_event_read;
 	rtit_pmu.setup_aux	= rtit_buffer_setup_aux;
 	rtit_pmu.free_aux	= rtit_buffer_free_aux;
+	rtit_pmu.addr_filters_sync     = rtit_event_addr_filters_sync;
+	rtit_pmu.addr_filters_validate = rtit_event_addr_filters_validate;
+	rtit_pmu.nr_addr_filters       = RTIT_FILTERS_NUM;
 	ret = perf_pmu_register(&rtit_pmu, "intel_pt", -1);
 
 	return ret;
