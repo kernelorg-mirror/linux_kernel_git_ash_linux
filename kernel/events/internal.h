@@ -60,6 +60,11 @@ struct ring_buffer {
 extern void rb_free(struct ring_buffer *rb);
 extern void ring_buffer_unaccount(struct ring_buffer *rb, bool aux);
 
+extern int perffs_create_event_file(struct perf_event *event,
+				    struct task_struct *task,
+				    const struct file_operations *fops);
+extern void perffs_remove(struct dentry *dentry);
+
 static inline void rb_free_rcu(struct rcu_head *rcu_head)
 {
 	struct ring_buffer *rb;

@@ -66,6 +66,8 @@
 
 #define TRACEFS_MAGIC          0x74726163
 
+#define PERFFS_MAGIC           0x70657266
+
 #define V9FS_MAGIC		0x01021997
 
 #define BDEVFS_MAGIC            0x62646576
