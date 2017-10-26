@@ -5695,7 +5695,8 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
 }
 
 static unsigned long perf_aux_sampler_trace(struct perf_event *event,
-					    struct perf_sample_data *data)
+					    struct perf_sample_data *data,
+					    size_t size)
 {
 	struct perf_event *sampler = event->sample_event;
 	struct ring_buffer *rb;
@@ -5730,13 +5731,12 @@ static unsigned long perf_aux_sampler_trace(struct perf_event *event,
 
 	data->aux.to = rb->aux_head;
 
-	if (data->aux.to < sampler->attr.aux_sample_size)
-		data->aux.from = rb->aux_nr_pages * PAGE_SIZE +
-			data->aux.to - sampler->attr.aux_sample_size;
+	if (data->aux.to < size)
+		data->aux.from = rb->aux_nr_pages * PAGE_SIZE + data->aux.to -
+			size;
 	else
-		data->aux.from = data->aux.to -
-			sampler->attr.aux_sample_size;
-	data->aux.size = ALIGN(sampler->attr.aux_sample_size, sizeof(u64));
+		data->aux.from = data->aux.to - size;
+	data->aux.size = ALIGN(size, sizeof(u64));
 	ring_buffer_put(rb);
 
 out:
@@ -6283,12 +6283,29 @@ void perf_prepare_sample(struct perf_event_header *header,
 		data->phys_addr = perf_virt_to_phys(data->addr);
 
 	if (sample_type & PERF_SAMPLE_AUX) {
-		u64 size = sizeof(u64);
+		u64 size;
 
-		size += perf_aux_sampler_trace(event, data);
+		header->size += sizeof(u64); /* size */
 
+		/*
+		 * Given the 16bit nature of header::size, an AUX sample can
+		 * easily overflow it, what with all the preceding sample bits.
+		 * Make sure this doesn't happen by using up to U16_MAX bytes
+		 * per sample in total (rounded down to 8 byte boundary).
+		 */
+		size = min_t(u16, 0xfff0 - header->size,
+			     event->attr.aux_sample_size);
+		size = perf_aux_sampler_trace(event, data, size);
+
+		WARN_ON_ONCE(size + header->size > U16_MAX);
 		header->size += size;
 	}
+	/*
+	 * If you're adding more sample types here, you likely need to do
+	 * something about the overflowing header::size, like repurpose the
+	 * lowest 3 bits of size, which should be always zero at the moment.
+	 */
+	WARN_ON_ONCE(header->size & 7);
 }
 
 static void __always_inline
