@@ -271,6 +271,23 @@ void perf_output_end(struct perf_output_handle *handle)
 	rcu_read_unlock();
 }
 
+struct pmu_info_header *perf_event_get_pmu_info(struct perf_event *event)
+{
+	struct ring_buffer *rb = event->rb;
+	struct perf_event_attr *attr;
+	struct pmu_info_header *pih;
+
+	//WARN_ON_ONCE(!in_atomic());
+
+	if (!rb)
+		return NULL;
+
+	attr = (void *)rb->user_page + rb->user_page->pmu_offset;
+	pih = (void *)attr + sizeof(*attr);
+
+	return pih;
+}
+
 static void perf_event_init_pmu_info(struct perf_event *event,
 				     struct perf_event_mmap_page *userpg)
 {
