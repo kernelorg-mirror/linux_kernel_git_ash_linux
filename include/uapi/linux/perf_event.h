@@ -1121,7 +1121,8 @@ struct intel_pt_pmu_info {
 	__u8			x86_tsc_max_nonturbo_ratio;
 	__u32			x86_tsc_to_art_numerator;
 	__u32			x86_tsc_to_art_denominator;
-	__u32			__reserved_0;
+	__u32			rtit_ctl_high;
+	__u64			addrs[8];	/* 4 address pairs */
 };
 
 #endif /* _UAPI_LINUX_PERF_EVENT_H */

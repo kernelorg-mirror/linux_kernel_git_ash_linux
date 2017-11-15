@@ -485,6 +485,32 @@ static u64 pt_config_filters(struct perf_event *event)
 	return rtit_ctl;
 }
 
+/*
+ * Update address filters configuration in the PMU info block
+ */
+static void pt_update_pmu_info(struct perf_event *event)
+{
+	struct pmu_info_header *pih = perf_event_get_pmu_info(event);
+	struct pt_filters *filters = event->hw.addr_filters;
+	struct intel_pt_pmu_info *pi;
+	int range;
+
+	if (!pih)
+		return;
+
+	pi = (struct intel_pt_pmu_info *)pih;
+	pi->rtit_ctl_high = 0;
+
+	for (range = 0; range < filters->nr_filters; range++) {
+		struct pt_filter *filter = &filters->filter[range];
+
+		pi->addrs[range * 2]     = filter->msr_a;
+		pi->addrs[range * 2 + 1] = filter->msr_b;
+		pi->rtit_ctl_high |= filter->config <<
+			(pt_address_ranges[range].reg_off - 32);
+	}
+}
+
 static void pt_config(struct perf_event *event)
 {
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
@@ -1258,6 +1284,7 @@ static void pt_event_addr_filters_sync(struct perf_event *event)
 	}
 
 	filters->nr_filters = range;
+	pt_update_pmu_info(event);
 }
 
 /**
