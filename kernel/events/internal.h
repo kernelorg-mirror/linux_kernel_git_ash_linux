@@ -104,6 +104,7 @@ extern int rb_alloc_detached(struct perf_event *event,
 			     struct mm_struct *mm,
 			     struct ring_buffer *parent_rb);
 extern void rb_free_detached(struct ring_buffer *rb, struct perf_event *event);
+extern int rb_shmem_setup(struct perf_event *event, struct task_struct *task);
 extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct ring_buffer *rb);
 

@@ -1003,44 +1003,45 @@ static void rb_shmem_unmap(struct perf_event *event)
 	rb->shmem_file_addr = 0;
 }
 
-static int rb_shmem_setup(struct perf_event *event,
-			  struct task_struct *task,
-			  struct ring_buffer *rb)
+int rb_shmem_setup(struct perf_event *event, struct task_struct *task)
 {
-	int nr_pages, err;
+	struct ring_buffer *rb;
+	int err = 0;
 	char *name;
 
-	if (WARN_ON_ONCE(!task))
+	if (WARN_ON_ONCE(!task || !event->dent))
 		return -EINVAL;
 
-	name = event->dent && event->dent->d_name.name ?
-		kasprintf(GFP_KERNEL, "perf/%s",
-			  event->dent->d_name.name) :
-		kasprintf(GFP_KERNEL, "perf/%s/%d", event->pmu->name,
-			  task_pid_nr_ns(task, event->ns));
-	if (!name)
-		return -ENOMEM;
+	rb = ring_buffer_get(event);
+	if (!rb)
+		return -ENOENT;
+
+	name = kasprintf(GFP_KERNEL, "perf/%s", event->dent->d_name.name);
+	if (!name) {
+		err = -ENOMEM;
+		goto out;
+	}
 
 	WARN_ON_ONCE(rb->user_page);
 
-	nr_pages = rb->nr_pages + rb->aux_nr_pages + 1;
-	rb->shmem_file = shmem_file_setup(name, nr_pages << PAGE_SHIFT,
+	rb->shmem_file = shmem_file_setup(name, perf_rb_size(rb),
 					  VM_NORESERVE);
 	kfree(name);
 
 	if (IS_ERR(rb->shmem_file)) {
 		err = PTR_ERR(rb->shmem_file);
 		rb->shmem_file = NULL;
-		return err;
+		goto out;
 	}
 
 	mapping_set_gfp_mask(rb->shmem_file->f_mapping,
 			     GFP_HIGHUSER | __GFP_RECLAIMABLE);
 
 	event->dent->d_inode->i_mapping = rb->shmem_file->f_mapping;
-	event->attach_state |= PERF_ATTACH_SHMEM;
+out:
+	ring_buffer_put(rb);
 
-	return 0;
+	return err;
 }
 
 /*
@@ -1279,11 +1280,7 @@ int rb_alloc_detached(struct perf_event *event, struct task_struct *task,
 	}
 
 	if (flags & RING_BUFFER_SHMEM) {
-		ret = rb_shmem_setup(event, task, rb);
-		if (ret)
-			goto err_free_aux;
-
-		rb_toggle_paused(rb, true);
+		event->attach_state |= PERF_ATTACH_SHMEM;
 	} else {
 		atomic_inc(&rb->mmap_count);
 		if (aux_nr_pages)
@@ -1299,10 +1296,6 @@ int rb_alloc_detached(struct perf_event *event, struct task_struct *task,
 	event->attach_state |= PERF_ATTACH_DETACHED;
 
 	return 0;
-
-err_free_aux:
-	if (!(flags & RING_BUFFER_SHMEM))
-		rb_free_aux(rb);
 
 err_unaccount:
 	if (flags & RING_BUFFER_SHMEM)
@@ -1337,6 +1330,8 @@ void rb_free_detached(struct ring_buffer *rb, struct perf_event *event)
 	rcu_assign_pointer(event->rb, NULL);
 	rb_free_aux(rb);
 	rb_free(rb);
+
+	event->attach_state &= ~(PERF_ATTACH_DETACHED | PERF_ATTACH_SHMEM);
 }
 
 #ifndef CONFIG_PERF_USE_VMALLOC
