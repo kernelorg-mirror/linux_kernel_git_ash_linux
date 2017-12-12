@@ -951,6 +951,7 @@ int rb_inject(struct perf_event *event)
 		       MAP_SHARED | MAP_POPULATE, 0);
 
 	mmput(mm);
+	rb->user_page->aux_head = 0;
 	rb->mmap_mapping = mm;
 	rb->shmem_file_addr = addr;
 
@@ -1077,8 +1078,12 @@ restart:
 		set_page_dirty(page);
 		page->mapping = mapping;
 
-		if (page == perf_mmap_to_page(rb, i))
+		if (page == perf_mmap_to_page(rb, i)) {
+			/* erase AUX data */
+			if (!rb->shmem_file_addr && i > rb->nr_pages)
+				memset(page_address(page), 0, PAGE_SIZE);
 			continue;
+		}
 
 		changed++;
 		if (!i) {
