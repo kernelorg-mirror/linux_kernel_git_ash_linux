@@ -10084,6 +10084,12 @@ SYSCALL_DEFINE5(perf_event_open,
 	}
 
 	if (detached) {
+		/*
+		 * Allow PMU drivers to opt out of supporting detached events
+		 */
+		if (pmu->capabilities & PERF_PMU_CAP_NO_DETACHED)
+			goto err_file;
+
 		err = perf_event_detach(event, task, NULL);
 		if (err)
 			goto err_file;
