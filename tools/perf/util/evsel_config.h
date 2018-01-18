@@ -25,6 +25,7 @@ enum evsel_term_type {
 	PERF_EVSEL__CONFIG_TERM_BRANCH,
 	PERF_EVSEL__CONFIG_TERM_PERCORE,
 	PERF_EVSEL__CONFIG_TERM_AUX_OUTPUT,
+	PERF_EVSEL__CONFIG_TERM_AUX_SAMPLE_SIZE,
 };
 
 struct perf_evsel_config_term {
@@ -44,7 +45,15 @@ struct perf_evsel_config_term {
 		unsigned long max_events;
 		bool	      percore;
 		bool	      aux_output;
+		u64           aux_sample_size;
 	} val;
 	bool weak;
 };
+
+struct perf_evsel_config_term *__perf_evsel__get_config_term(struct evsel *evsel,
+							     enum evsel_term_type type);
+
+#define perf_evsel__get_config_term(evsel, type) \
+	__perf_evsel__get_config_term(evsel, PERF_EVSEL__CONFIG_TERM_ ## type)
+
 #endif // __PERF_EVSEL_CONFIG_H
